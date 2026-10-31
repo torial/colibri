@@ -1721,9 +1721,50 @@ static void numa_slab_bind(void *p, size_t n){
     (void)p;(void)n;
 #endif
 }
+/* ---- COLI_NUMA=2: the dense trunk bound the way the team reads it (numa_topo.h) ----
+ * Every decode matmul of the trunk is `omp parallel for schedule(static)` over the output rows:
+ * thread t always reads the same slice [t*O/T,(t+1)*O/T) of every tensor. With the team laid out
+ * node by node (OMP_PLACES from numa_topo.h) and each tensor's bytes bound to the nodes in the
+ * proportion of their cores, those reads are all local; interleaved they are half remote on two
+ * sockets. Only the dense tensors (qalloc >= 2 MB) get this: the expert slabs are picked per token
+ * by a dynamic schedule and stay interleaved. Not tested on a real multi-socket host. */
+static int g_numa_dn=0;                         /* nodes that hold cores, in team order (0: COLI_NUMA=2 off) */
+#ifdef __linux__
+static int g_numa_mode=0;                       /* COLI_NUMA's value: 1 interleave, 2 + dense blocks */
+static int g_numa_dnode[COLI_TOPO_MAX_NODES];   /* their kernel ids */
+static int g_numa_dcores[COLI_TOPO_MAX_NODES];  /* and their core counts */
+static int g_numa_dtotal=0;
+#endif
+/* where the piece of the cores up to `acc` of `total` ends in [lo,hi): page aligned, the last piece to hi */
+static uintptr_t numa_dense_cut(uintptr_t lo, uintptr_t hi, int acc, int total){
+    if(acc>=total) return hi;
+    unsigned long long span=hi-lo;
+    return lo + (uintptr_t)((span*(unsigned)acc/(unsigned)total) & ~(unsigned long long)4095);
+}
+static void numa_dense_bind(void *p, size_t n){
+#ifdef __linux__
+    if(g_numa_dn<2 || g_numa_skip_bind || !p || !n) return;
+    uintptr_t lo=((uintptr_t)p+4095) & ~(uintptr_t)4095, hi=((uintptr_t)p+n) & ~(uintptr_t)4095;
+    if(hi<=lo) return;
+    int acc=0; uintptr_t at=lo;
+    for(int k=0;k<g_numa_dn;k++){
+        acc+=g_numa_dcores[k];
+        uintptr_t end = numa_dense_cut(lo,hi,k==g_numa_dn-1?g_numa_dtotal:acc,g_numa_dtotal);
+        if(end>at){
+            unsigned long mask=1UL<<g_numa_dnode[k];
+            /* MPOL_BIND, MPOL_MF_MOVE: a malloc block reused from the heap may have touched pages */
+            syscall(SYS_mbind,at,(size_t)(end-at),2/*MPOL_BIND*/,&mask,64UL+1,2/*MPOL_MF_MOVE*/);
+            at=end;
+        }
+    }
+#else
+    (void)p;(void)n;
+#endif
+}
 static void numa_init(void){
 #ifdef __linux__
     if(!getenv("COLI_NUMA")||!atoi(getenv("COLI_NUMA"))) return;
+    g_numa_mode=atoi(getenv("COLI_NUMA"));
     for(int i=0;i<64;i++){ char pth[64]; snprintf(pth,sizeof(pth),"/sys/devices/system/node/node%d",i);
         struct stat st; if(stat(pth,&st)) break; g_numa_nodes=i+1; }
     if(g_numa_nodes<2){ fprintf(stderr,"[NUMA] single node: COLI_NUMA ignored\n"); return; }
@@ -1745,6 +1786,17 @@ static void numa_init(void){
       }
     }
     fprintf(stderr,"[NUMA] expert slabs interleaved across %d nodes\n",g_numa_nodes);
+    if(g_numa_mode>=2){
+        static coli_topo tp; unsigned char am[COLI_TOPO_MAX_CPUS];
+        if(coli_topo_load(&tp,"/sys",coli_topo_allowed_mask(am)) && tp.nnodes>=2){
+            g_numa_dn=tp.nnodes; g_numa_dtotal=0;
+            for(int k=0;k<tp.nnodes;k++){ g_numa_dnode[k]=tp.node_id[k]; g_numa_dcores[k]=tp.node_cores[k]; g_numa_dtotal+=tp.node_cores[k]; }
+            fprintf(stderr,"[NUMA] dense tensors (>=2 MB) bound by thread block:");
+            for(int k=0;k<tp.nnodes;k++) fprintf(stderr," node%d=%d cores",tp.node_id[k],tp.node_cores[k]);
+            const char *pl=getenv("OMP_PLACES");
+            fprintf(stderr,"%s\n",(pl&&*pl&&*pl!='c')?"" :"  [WARNING: OMP_PLACES is not the node-ordered list; threads and blocks may not line up]");
+        } else fprintf(stderr,"[NUMA] COLI_NUMA=2: no multi-node topology in sysfs, dense tensors stay as they are\n");
+    }
 #endif
 }
 
@@ -1755,7 +1807,8 @@ static void *qalloc(size_t n){
         coli_metal_register(p,r); return p; }
 #endif
     void *p=malloc(n);
-    if(n>=(size_t)1<<20) numa_slab_bind(p,n);      /* resident dense weights too (#82: attention/shared stream from RAM every token) */
+    if(n>=(size_t)1<<21 && g_numa_dn>=2) numa_dense_bind(p,n);   /* COLI_NUMA=2: the rows each thread block reads, local */
+    else if(n>=(size_t)1<<20) numa_slab_bind(p,n);      /* resident dense weights too (#82: attention/shared stream from RAM every token) */
     return p;
 }
 static float *qsalloc(int O){ return (float*)qalloc((size_t)O*sizeof(float)); }
@@ -14124,7 +14177,9 @@ int main(int argc, char **argv){
          * a core's SMT siblings are numbered side by side (Intel's hybrid CPUs on Linux: CPUs
          * 0,1 are P-core 0) a team of the physical-core count landed on half the cores, both
          * threads of each. i5-13500, Mistral-Large-4 decode: the 6-thread team on CPUs 0-5. */
-        setenv("OMP_PLACES","cores",0);
+        { /* COLI_NUMA=2: the team laid out node by node, so thread t's rows are on t's node (numa_topo.h) */
+          static char np[16384];
+          setenv("OMP_PLACES",coli_numa_local_places(np,sizeof np)?np:"cores",0); }
         setenv("OMP_DYNAMIC","FALSE",0);       /* fixed team size: no per-region thread-count churn */
         setenv("COLI_OMP_TUNED","1",1);
 #ifdef __linux__

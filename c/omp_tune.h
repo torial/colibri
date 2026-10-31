@@ -44,6 +44,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include "numa_topo.h"
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -285,7 +286,10 @@ static void coli_omp_hot_team(char **argv, const char *engine, int gpu_on)
     setenv("GOMP_SPINCOUNT", "200000", 0);
     setenv("KMP_BLOCKTIME", "200", 0);
     setenv("OMP_PROC_BIND", "close", 0);
-    setenv("OMP_PLACES", "cores", 0);
+    {   /* COLI_NUMA=2: the team laid out node by node (numa_topo.h); otherwise a place per core */
+        static char np[16384];
+        setenv("OMP_PLACES", coli_numa_local_places(np, sizeof np) ? np : "cores", 0);
+    }
     setenv("OMP_DYNAMIC", "FALSE", 0);
     setenv("COLI_OMP_TUNED", "1", 1);
     fprintf(stderr, "[OMP] %s: hot-thread tuning, re-exec once (COLI_NO_OMP_TUNE=1 to skip)\n", engine);

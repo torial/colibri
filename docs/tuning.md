@@ -22,6 +22,7 @@ is safe on any machine. See also [SETTINGS.md](SETTINGS.md) and
 | `PIPE=0` | disable the async expert-load pool (default ON — overlaps `pread` with matmul, −18% disk service) |
 | `DIRECT=1` | O_DIRECT expert reads (measured **+65%** alone on a Strix Halo, [#200](https://github.com/JustVugg/colibri/issues/200)) |
 | `COLI_NUMA=1` | interleave resident weights across NUMA nodes on multi-socket hosts ([#82](https://github.com/JustVugg/colibri/issues/82)) |
+| `COLI_NUMA=2` | as 1, plus the team laid out node by node and dense tensors bound by thread block (experimental; [dell-7820.md](dell-7820.md)) |
 | `CACHE_ROUTE=1` | cache-aware max-rank routing (opt-in, [#199](https://github.com/JustVugg/colibri/issues/199)) |
 | `AUTOPIN=0` | disable the learning cache's auto-pin |
 | `CAP_RAISE=0` | don't auto-grow the expert cache |

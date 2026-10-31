@@ -2245,6 +2245,20 @@ tests/test_tile16$(EXE): tests/test_tile16.c
 tests/test_idot_r16$(EXE): tests/test_idot_r16.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# Worst-case operands for every idot tier (the AVX-512BW tier's vpmaddubsw must not saturate).
+tests/test_idot_extreme$(EXE): tests/test_idot_extreme.c idot.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# numa_topo.h against fake sysfs trees, and numa_dense_bind's block arithmetic (COLI_NUMA=2).
+tests/test_numa_topo$(EXE): tests/test_numa_topo.c numa_topo.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_numa_dense$(EXE): tests/test_numa_dense.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# Throughput of the idot tiers (build once per ARCH and compare); not part of `make test`.
+tests/bench_idot_tiers$(EXE): tests/bench_idot_tiers.c idot.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_logprob_status$(EXE): tests/test_logprob_status.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
