@@ -529,12 +529,26 @@ static inline __attribute__((always_inline)) void xf16_body512(float *const *y, 
         }
         for (int s = 0; s < S; s++) {
             const int8_t *xb = xq[s] + (size_t)b * XF_BLOCK;
+#if defined(COLI_IDOT_AVX512BW)
+            /* no vpdpbusd: the eight vpmaddubsw of a block are summed in int16 and widened once.
+             * Each pair is <= 2 * 15 * 127 = 3810, eight of them <= 30480 < 32767: exact, and
+             * 16 ALU ops per accumulator instead of the 24 of eight emulated vpdpbusd. */
+            __m512i q0 = _mm512_maddubs_epi16(lo[0], _mm512_set1_epi32(xf16_ld32(xb)));
+            __m512i q1 = _mm512_maddubs_epi16(hi[0], _mm512_set1_epi32(xf16_ld32(xb + 32)));
+            for (int W = 1; W < 8; W++) {
+                q0 = _mm512_add_epi16(q0, _mm512_maddubs_epi16(lo[W], _mm512_set1_epi32(xf16_ld32(xb + 4 * W))));
+                q1 = _mm512_add_epi16(q1, _mm512_maddubs_epi16(hi[W], _mm512_set1_epi32(xf16_ld32(xb + 32 + 4 * W))));
+            }
+            __m512i p0 = _mm512_madd_epi16(q0, _mm512_set1_epi16(1));
+            __m512i p1 = _mm512_madd_epi16(q1, _mm512_set1_epi16(1));
+#else
             __m512i p0 = coli_dpbusd512(_mm512_setzero_si512(), lo[0], _mm512_set1_epi32(xf16_ld32(xb)));
             __m512i p1 = coli_dpbusd512(_mm512_setzero_si512(), hi[0], _mm512_set1_epi32(xf16_ld32(xb + 32)));
             for (int W = 1; W < 8; W++) {
                 p0 = coli_dpbusd512(p0, lo[W], _mm512_set1_epi32(xf16_ld32(xb + 4 * W)));
                 p1 = coli_dpbusd512(p1, hi[W], _mm512_set1_epi32(xf16_ld32(xb + 32 + 4 * W)));
             }
+#endif
             const int32_t *x16 = xs[s] + 4 * (size_t)b; const float *d = dx[s] + 2 * (size_t)b;
             p0 = _mm512_sub_epi32(p0, _mm512_set1_epi32(8 * (x16[0] + x16[1])));
             p1 = _mm512_sub_epi32(p1, _mm512_set1_epi32(8 * (x16[2] + x16[3])));
