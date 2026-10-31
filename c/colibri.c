@@ -1709,7 +1709,28 @@ static int g_numa_skip_bind=0;  /* raised around the GPU-prefix pin load: those 
                                  * upload staging, freed right after — binding them buys
                                  * nothing and costs ~2 transient VMAs each (#419) */
 #endif
+/* ---- COLI_THP=1: ask for transparent huge pages on the big weight regions ----
+ * 100+ GB of weights read at random (one expert here, one there) is a lot of 4 KB pages for the
+ * TLB; 2 MB pages cut the misses. madvise(MADV_HUGEPAGE) is a hint: it only matters where
+ * /sys/kernel/mm/transparent_hugepage/enabled is `madvise` or `always`, it fails harmlessly
+ * otherwise, and it must land before the pages are first touched (the callers allocate, hint,
+ * then read the weights in). Opt-in: untested on the target host. */
+static int g_thp=-1;
+static void coli_thp_hint(void *p, size_t n){
+#ifdef __linux__
+    if(g_thp<0){ const char *e=getenv("COLI_THP"); g_thp=(e&&*e&&atoi(e))?1:0;
+        if(g_thp) fprintf(stderr,"[THP] MADV_HUGEPAGE on the dense weights and expert slabs\n"); }
+    if(!g_thp || !p || n<((size_t)2<<20)) return;
+#ifdef MADV_HUGEPAGE
+    uintptr_t lo=((uintptr_t)p+((2UL<<20)-1)) & ~((2UL<<20)-1), hi=((uintptr_t)p+n) & ~((2UL<<20)-1);
+    if(hi>lo) madvise((void*)lo,(size_t)(hi-lo),MADV_HUGEPAGE);
+#endif
+#else
+    (void)p;(void)n;
+#endif
+}
 static void numa_slab_bind(void *p, size_t n){
+    coli_thp_hint(p,n);
 #ifdef __linux__
     if(g_numa_nodes<2 || g_numa_skip_bind || !p || !n) return;
     unsigned long mask=(1UL<<g_numa_nodes)-1;
@@ -1742,6 +1763,7 @@ static uintptr_t numa_dense_cut(uintptr_t lo, uintptr_t hi, int acc, int total){
     return lo + (uintptr_t)((span*(unsigned)acc/(unsigned)total) & ~(unsigned long long)4095);
 }
 static void numa_dense_bind(void *p, size_t n){
+    coli_thp_hint(p,n);
 #ifdef __linux__
     if(g_numa_dn<2 || g_numa_skip_bind || !p || !n) return;
     uintptr_t lo=((uintptr_t)p+4095) & ~(uintptr_t)4095, hi=((uintptr_t)p+n) & ~(uintptr_t)4095;
@@ -1807,6 +1829,7 @@ static void *qalloc(size_t n){
         coli_metal_register(p,r); return p; }
 #endif
     void *p=malloc(n);
+    if(n>=(size_t)1<<21) coli_thp_hint(p,n);                     /* COLI_THP=1 */
     if(n>=(size_t)1<<21 && g_numa_dn>=2) numa_dense_bind(p,n);   /* COLI_NUMA=2: the rows each thread block reads, local */
     else if(n>=(size_t)1<<20) numa_slab_bind(p,n);      /* resident dense weights too (#82: attention/shared stream from RAM every token) */
     return p;

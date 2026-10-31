@@ -15,6 +15,12 @@ int main(void){
     assert(numa_dense_cut(lo,hi,2,4)==lo+((uintptr_t)24<<20));
     assert(numa_dense_cut(lo,hi,4,4)==hi);
     assert((numa_dense_cut(lo,lo+4096*1000+123*4096,1,3)&4095)==0);
+    { /* COLI_THP: a hint on a big mapping and on a tiny one must be harmless */
+      setenv("COLI_THP","1",1); g_thp=-1;
+      char *q=mmap(NULL,(size_t)8<<20,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+      if(q!=MAP_FAILED){ coli_thp_hint(q,(size_t)8<<20); coli_thp_hint(q+4096,100); coli_thp_hint(NULL,1<<22);
+                         for(size_t i=0;i<((size_t)8<<20);i+=4096) q[i]=1; munmap(q,(size_t)8<<20); }
+      assert(g_thp==1); unsetenv("COLI_THP"); g_thp=0; }
     size_t n=(size_t)48<<20;
     char *p=mmap(NULL,n,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
     if(p==MAP_FAILED){ puts("numa_dense: mmap failed, skipped the bind half"); return 0; }
