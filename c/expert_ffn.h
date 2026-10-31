@@ -48,6 +48,7 @@
 
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
 #include <immintrin.h>
+#include "dpbusd512.h"
 #endif
 #if defined(__ARM_NEON) && defined(__aarch64__)
 #include <arm_neon.h>
@@ -510,8 +511,9 @@ static inline float xf_dot_a32(const uint8_t *w, const float *sc, const int8_t *
     }
     return acc;
 }
-#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
-/* the 16 rows of a group against S <= 8 activation rows: y[s][o .. o + 15] */
+#if defined(__AVX512F__) && defined(__AVX512BW__) && (defined(__AVX512VNNI__) || defined(COLI_IDOT_AVX512BW))
+/* the 16 rows of a group against S <= 8 activation rows: y[s][o .. o + 15]. The codes are
+ * nibbles <= 15, so the AVX-512BW emulation of vpdpbusd (coli_dpbusd512) cannot saturate. */
 static inline __attribute__((always_inline)) void xf16_body512(float *const *y, int o, const uint8_t *grp, const int8_t *const *xq,
                                                               const float *const *dx, const int32_t *const *xs, int I, const int S) {
     const __m512i m4 = _mm512_set1_epi8(15);
@@ -527,11 +529,11 @@ static inline __attribute__((always_inline)) void xf16_body512(float *const *y, 
         }
         for (int s = 0; s < S; s++) {
             const int8_t *xb = xq[s] + (size_t)b * XF_BLOCK;
-            __m512i p0 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), lo[0], _mm512_set1_epi32(xf16_ld32(xb)));
-            __m512i p1 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), hi[0], _mm512_set1_epi32(xf16_ld32(xb + 32)));
+            __m512i p0 = coli_dpbusd512(_mm512_setzero_si512(), lo[0], _mm512_set1_epi32(xf16_ld32(xb)));
+            __m512i p1 = coli_dpbusd512(_mm512_setzero_si512(), hi[0], _mm512_set1_epi32(xf16_ld32(xb + 32)));
             for (int W = 1; W < 8; W++) {
-                p0 = _mm512_dpbusd_epi32(p0, lo[W], _mm512_set1_epi32(xf16_ld32(xb + 4 * W)));
-                p1 = _mm512_dpbusd_epi32(p1, hi[W], _mm512_set1_epi32(xf16_ld32(xb + 32 + 4 * W)));
+                p0 = coli_dpbusd512(p0, lo[W], _mm512_set1_epi32(xf16_ld32(xb + 4 * W)));
+                p1 = coli_dpbusd512(p1, hi[W], _mm512_set1_epi32(xf16_ld32(xb + 32 + 4 * W)));
             }
             const int32_t *x16 = xs[s] + 4 * (size_t)b; const float *d = dx[s] + 2 * (size_t)b;
             p0 = _mm512_sub_epi32(p0, _mm512_set1_epi32(8 * (x16[0] + x16[1])));

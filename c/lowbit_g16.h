@@ -29,7 +29,8 @@
 #define COLI_LOWBIT_G16_H
 
 #include <string.h>
-#include "int2_g32.h"   /* x2_quant_act, x2_hsum8_scalar, X2_MAX_ROWS */
+#include "int2_g32.h"
+#include "dpbusd512.h"   /* x2_quant_act, x2_hsum8_scalar, X2_MAX_ROWS */
 
 static const int8_t XL_LEVELS2[4] = { -10, -3, 3, 10 };
 static const int8_t XL_LEVELS3[8] = { -26, -16, -9, -3, 3, 9, 16, 26 };
@@ -259,8 +260,9 @@ static inline float xl16_ref(const uint8_t *codes, const uint8_t *q, float d, in
 #if defined(__AVX2__) && defined(__FMA__)
 #define XL16_ON 1
 static inline int32_t xl16_ld32(const int8_t *p) { int32_t v; memcpy(&v, p, 4); return v; }
-#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
-/* 16 rows (one group) against S <= 8 activation rows: y[s * ystride + r] */
+#if defined(__AVX512F__) && defined(__AVX512BW__) && (defined(__AVX512VNNI__) || defined(COLI_IDOT_AVX512BW))
+/* (codes are levels + B <= 78 unsigned: the AVX-512BW vpdpbusd emulation cannot saturate)
+ * 16 rows (one group) against S <= 8 activation rows: y[s * ystride + r] */
 static inline __attribute__((always_inline)) void xl16_body512(float *y, int ystride, const uint8_t *grp, const int8_t *xq,
                                                               const float *dx, const int32_t *xs, int I, const int S, const int bits) {
     const int B = bits == 3 ? 26 : 10;   /* levels + B are the unsigned codes */
@@ -290,11 +292,11 @@ static inline __attribute__((always_inline)) void xl16_body512(float *y, int yst
         for (int i = 0; i < 8; i++) c[i] = _mm512_shuffle_epi8(lut, c[i]);
         for (int s = 0; s < S; s++) {
             const int8_t *xb = xq + (size_t)s * I + 32 * (size_t)g;
-            __m512i p0 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), c[0], _mm512_set1_epi32(xl16_ld32(xb)));
-            __m512i p1 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), c[4], _mm512_set1_epi32(xl16_ld32(xb + 16)));
+            __m512i p0 = coli_dpbusd512(_mm512_setzero_si512(), c[0], _mm512_set1_epi32(xl16_ld32(xb)));
+            __m512i p1 = coli_dpbusd512(_mm512_setzero_si512(), c[4], _mm512_set1_epi32(xl16_ld32(xb + 16)));
             for (int i = 1; i < 4; i++) {
-                p0 = _mm512_dpbusd_epi32(p0, c[i], _mm512_set1_epi32(xl16_ld32(xb + 4 * i)));
-                p1 = _mm512_dpbusd_epi32(p1, c[4 + i], _mm512_set1_epi32(xl16_ld32(xb + 16 + 4 * i)));
+                p0 = coli_dpbusd512(p0, c[i], _mm512_set1_epi32(xl16_ld32(xb + 4 * i)));
+                p1 = coli_dpbusd512(p1, c[4 + i], _mm512_set1_epi32(xl16_ld32(xb + 16 + 4 * i)));
             }
             const int32_t *x16 = xs + (size_t)s * (I / 16) + 2 * (size_t)g;
             p0 = _mm512_sub_epi32(p0, _mm512_set1_epi32(B * x16[0])); p1 = _mm512_sub_epi32(p1, _mm512_set1_epi32(B * x16[1]));
