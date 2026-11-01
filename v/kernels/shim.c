@@ -67,6 +67,19 @@ int coli_k_threads(void) {
 void coli_k_matmul_f32(float *y, const float *x, const float *W, int S, int I, int O) { matmul(y, x, W, S, I, O); }
 float coli_k_dot_f32(const float *x, const float *w, int I) { return dot_f32_lanes(x, w, I); }
 
+/* the OLMoE engine's own int8 matmul (c/olmoe.c matmul_q: one activation row, `omp simd reduction` per output),
+ * which is not quant.h's: the V olmoe port calls this one so its logits are the engine's bits */
+void coli_k_olm_matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int I, int O) {
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++) {
+        const int8_t *w = q + (int64_t)o * I;
+        float acc = 0.f;
+        #pragma omp simd reduction(+:acc)
+        for (int i = 0; i < I; i++) acc += x[i] * (float)w[i];
+        y[o] = acc * scale[o];
+    }
+}
+
 /* int8 / int4 / fp8 / mxfp4 weights, f32 activations */
 void coli_k_matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int S, int I, int O) { matmul_q(y, x, q, scale, S, I, O); }
 void coli_k_matmul_i4(float *y, const float *x, const uint8_t *q4, const float *scale, int S, int I, int O) { matmul_i4(y, x, q4, scale, S, I, O); }

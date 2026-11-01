@@ -5,6 +5,7 @@
 //   colibri_v isa
 //   colibri_v info <model-dir> [extra-dir;extra-dir]
 //   colibri_v tok <tokenizer.json> "text to encode"
+//   colibri_v olmoe <model-dir> "prompt" [new-tokens] [experts-cached-per-layer]
 //   colibri_v bench [threads] [seconds-per-kernel]
 //
 // `bench` is meant for a new machine (the Dell 7820, say): it prints, per kernel, the time of one call, the weight
@@ -17,9 +18,10 @@ import strconv
 import safetensors
 import tokenizer
 import kernels
+import olmoe
 
 fn usage() {
-	eprintln('usage: colibri_v isa | info <model-dir> [extra-dirs] | tok <tokenizer.json> <text> | bench [threads] [seconds]')
+	eprintln('usage: colibri_v isa | info <model-dir> [extra-dirs] | tok <tokenizer.json> <text> | olmoe <model-dir> <prompt> [new] [cap] | bench [threads] [seconds]')
 	exit(2)
 }
 
@@ -77,6 +79,29 @@ fn cmd_tok(path string, text string) {
 	ids := t.encode(text)
 	println(ids.map(it.str()).join(' '))
 	println(t.decode(ids))
+}
+
+// cmd_olmoe: greedy generation from a converted OLMoE checkpoint (merged-int8 experts), the V engine end to end:
+// tokenizer.json -> ids -> layers -> logits -> argmax -> text
+fn cmd_olmoe(dir string, prompt string, n_new int, cap int) {
+	tok := tokenizer.load('${dir}/tokenizer.json') or {
+		eprintln('${err}')
+		exit(1)
+	}
+	mut m := olmoe.open(dir, cap) or {
+		eprintln('${err}')
+		exit(1)
+	}
+	ids := tok.encode(prompt)
+	sw := time.new_stopwatch()
+	out := m.generate(ids, n_new) or {
+		eprintln('${err}')
+		exit(1)
+	}
+	secs := f64(sw.elapsed().nanoseconds()) / 1e9
+	println(tok.decode(out))
+	eprintln('${ids.len} prompt + ${n_new} new tokens in ${secs:.2f}s (${f64(n_new) / secs:.2f} new tok/s), experts: ${m.hits} hits ${m.miss} misses')
+	m.close()
 }
 
 // one benchmark: run `f` for about `secs` seconds, return seconds per call
@@ -161,6 +186,16 @@ fn main() {
 				usage()
 			}
 			cmd_tok(a[1], a[2])
+		}
+		'olmoe' {
+			if a.len < 3 {
+				usage()
+			}
+			cmd_olmoe(a[1], a[2], if a.len > 3 { a[3].int() } else { 32 }, if a.len > 4 {
+				a[4].int()
+			} else {
+				16
+			})
 		}
 		'bench' {
 			th := if a.len > 1 { a[1].int() } else { 0 }

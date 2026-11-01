@@ -18,6 +18,7 @@ fn C.coli_k_set_threads(n int)
 fn C.coli_k_threads() int
 fn C.coli_k_matmul_f32(y &f32, x &f32, w &f32, s int, i int, o int)
 fn C.coli_k_dot_f32(x &f32, w &f32, i int) f32
+fn C.coli_k_olm_matmul_q(y &f32, x &f32, q &u8, scale &f32, i int, o int)
 fn C.coli_k_matmul_q(y &f32, x &f32, q &i8, scale &f32, s int, i int, o int)
 fn C.coli_k_matmul_i4(y &f32, x &f32, q4 &u8, scale &f32, s int, i int, o int)
 fn C.coli_k_matmul_i4_grouped(y &f32, x &f32, q4 &u8, scale &f32, s int, i int, o int, gs int)
@@ -81,6 +82,18 @@ pub fn dot_f32(x []f32, w []f32) !f32 {
 		return error('dot_f32: lengths ${x.len} and ${w.len}')
 	}
 	return C.coli_k_dot_f32(x.data, w.data, x.len)
+}
+
+// olm_matmul_q: one activation row against int8 weights [O,I] (bytes, read as int8) with a scale per row, as the OLMoE
+// engine computes it (c/olmoe.c); y has O values
+pub fn olm_matmul_q(x []f32, q []u8, scale []f32, i int, o int) ![]f32 {
+	shape(1, i, o)!
+	need('x', x.len, i)!
+	need('q', q.len, i64(o) * i)!
+	need('scale', scale.len, o)!
+	mut y := []f32{len: o}
+	C.coli_k_olm_matmul_q(y.data, x.data, q.data, scale.data, i, o)
+	return y
 }
 
 // matmul_q: int8 weights [O,I] with one f32 scale per output row
