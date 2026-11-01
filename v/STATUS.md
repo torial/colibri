@@ -13,6 +13,7 @@ Branch `port/v-leaf-libs`. Everything below is verified by `./run_all.sh` (needs
 | `sample` | `c/sample.h` | `tests/sample_diff`: picks, distributions, RNG state, log-prob bits |
 | `kernels` | `c/quant.h`, `ggml_quants.h`, `matmul_f32.h`, `qi_gemm.h` | `tests/kern_diff`: output bits identical to the direct C call; builds for v2 / v3 / v4 / native |
 | `olmoe` | CPU path of `c/olmoe.c` | `tests/olmoe_diff`: the C engine and the V engine on generated tiny checkpoints, generated ids and every logit of every step bit-identical (v2 / v3 / v4 builds) |
+| `glm` | unquantized path of `c/colibri.c` | `tests/glm_diff`: ids identical, logits within 1e-4 of the C engine (13/16 bit-identical on real-GLM-aligned shapes) |
 | `cmd/colibri_v` | -- | `isa`, `info`, `tok`, `olmoe`, `bench` |
 
 Every differential test has mutation controls: a deliberate break of the V side must be caught. The few that were not
@@ -30,6 +31,8 @@ the expert prefetch pilot and hot-expert pinning, multi-threaded attention, the 
 bits only when V's generated C is compiled with the engine's flags (`-cflags "-O3 -march=..."`): FMA contraction in loops
 like `ctx += a * v` changes the last bit otherwise (the first run, without the flags, differed by ~1e-6 on every logit and
 agreed on every token).
+
+`glm` is the GLM-5.2 engine's f32 path (MLA, sigmoid router with selection bias, shared expert). It is the first engine checked to tolerance rather than to the bit in every case: where the bits differ the logits agree to ~1e-6 and the tokens are identical; the shape-dependent summation-order difference (seen when kv_lora + qk_rope is not a multiple of 4, and in a few aligned cases) is open. Quantized GLM (int8 / int4) is the next step toward running the real model.
 
 Next engines, each checked the same way against its C original on a tiny model: the dense-attention families share most of
 what `olmoe` has; GLM / DeepSeek need MLA attention and expert streaming from `c/*_chain.h`.
