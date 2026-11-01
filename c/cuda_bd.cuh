@@ -635,9 +635,21 @@ __device__ __forceinline__ bd_u32 bd_h2u(__half2 h) { return *reinterpret_cast<b
 __device__ __forceinline__ __half2 bd_u2h(bd_u32 u) { return *reinterpret_cast<__half2 *>(&u); }
 __device__ __forceinline__ void bd_codes_h(bd_u32 c4, __half2 off, __half2 s, __half2 m, bd_u32 *o) {
     /* four byte codes: bytes 0, 1 and 2, 3 with 0x64 above each, then (1024 + c - off) * s - m */
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 530
+    /* Maxwell (sm_52, a Quadro M6000 / GTX 9xx) has no half2 arithmetic and the headers do not
+     * declare __hsub2 / __hfma2 below sm_53: the same steps in float, rounded to f16 once at the
+     * end. The integer part (1024 + c - off) is exact in f32; a * s + m is one fmaf, so it differs
+     * from the f16 FMA only where the f32 sum itself rounds (a double rounding, <= 1 f16 ulp). */
+    const float2 fo = __half22float2(off), fs = __half22float2(s), fm = __half22float2(m);
+    const float2 a = __half22float2(bd_u2h(__byte_perm(c4, 0x64646464u, 0x5140u)));
+    const float2 b = __half22float2(bd_u2h(__byte_perm(c4, 0x64646464u, 0x5342u)));
+    o[0] = bd_h2u(__floats2half2_rn(fmaf(a.x - fo.x, fs.x, fm.x), fmaf(a.y - fo.y, fs.y, fm.y)));
+    o[1] = bd_h2u(__floats2half2_rn(fmaf(b.x - fo.x, fs.x, fm.x), fmaf(b.y - fo.y, fs.y, fm.y)));
+#else
     __half2 a = __hsub2(bd_u2h(__byte_perm(c4, 0x64646464u, 0x5140u)), off);
     __half2 b = __hsub2(bd_u2h(__byte_perm(c4, 0x64646464u, 0x5342u)), off);
     o[0] = bd_h2u(__hfma2(a, s, m)); o[1] = bd_h2u(__hfma2(b, s, m));
+#endif
 }
 /* two BF16 values as a half2, held to +-65504 as the f16 GEMMs hold their inputs (a NaN stays one) */
 __device__ __forceinline__ float bd_hold(float f) { return f != f ? f : fminf(fmaxf(f, -65504.f), 65504.f); }
