@@ -47,6 +47,20 @@ inference parameter count between ~13.5B and ~17.4B) is also unconfirmed. So: ho
 at best, days for 10-15 s. A CPU port is a way to run H3 *at all* on this machine, not a way to make a series.
 The weights fit (int8: ~15-17 GB transformer, bf16 encoder ~55 GB for its 50 layers, VAE ~10 GB), 192 GB is plenty.
 
+## With the Quadro M6000 (12 GB, Maxwell, ~5 TFLOP/s f32)
+
+The card cannot hold the transformer, but a diffusion step reads each layer's weights once, so layers can
+be streamed: ~17 GB of int8 weights over PCIe 3 is ~1.5 s a step, small against the compute. A cuBLAS-class f32 GEMM
+and a flash-style attention on the card would take a 4 s clip from ~21 to ~5 min a step
+(`python3 tools/h3_cost_model.py --gpu-tflops 5`): 8 steps ~40 min, 30 steps ~2.6 h; 10 s is ~21 min a step. The CPU and
+the card can also split the work (the CPU on one half of the heads / token blocks). The card has no tensor cores and
+no fast f16, so everything is f32 and the activations of a 25k-token clip (~0.5 GB per tensor) must be tiled. The CUDA
+backend in `c/` builds for sm_52 on branch `perf/xeon-skylake-sp`. NVIDIA's driver and CUDA need glibc (not Alpine).
+
+Done so far (branch `perf/flash-attn-f32`): `c/qi_flash.h`, a blocked f32 attention with constant memory
+(25k tokens of one head in 2.5 s on a 4-core VM, checked against the naive softmax); it replaces the Tq x Tk score matrix
+that makes long sequences impossible. A CUDA version of the same tiling for the M6000 is the matching GPU piece.
+
 ## Port plan, if it goes ahead
 
 The Qwen-Image engine (`c/qwenimage.c`, `qi_gemm.h`, `qwenimage_encoder.h`, `qwenimage_vae.h`) is

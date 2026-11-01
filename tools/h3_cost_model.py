@@ -33,18 +33,24 @@ def main():
     ap.add_argument("--eff", type=float, default=0.6, help="fraction of FMA peak a good kernel reaches (qi_gemm: ~0.63 on the VM)")
     ap.add_argument("--avx512-gain", type=float, default=1.0, help="multiplier if an AVX-512 kernel beats AVX2 (two FMA units: up to ~1.7)")
     ap.add_argument("--steps", type=int, default=30)
+    ap.add_argument("--gpu-tflops", type=float, default=0.0, help="sustained f32 TFLOP/s of a GPU that runs the matmuls with the weights streamed over PCIe (Quadro M6000: ~5)")
     a = ap.parse_args()
     peak = a.cores * a.ghz * 1e9 * 32          # 2 FMA ports x 8 f32 lanes x 2 flop
     rate = peak * a.eff * a.avx512_gain
     print(f"machine: {a.cores} cores x {a.ghz} GHz, AVX2 peak {peak/1e12:.2f} TFLOP/s, assumed {rate/1e12:.2f} TFLOP/s sustained")
     print(f"weights: bf16 ~2 bytes/param, int8 ~1: inference part ~14-17B params -> ~28-35 GB bf16, ~14-17 GB int8 (+ Qwen3-VL-32B encoder, first 50 of 64 layers)\n")
-    print(f"{'clip':>6} {'tokens':>8} {'latent T':>9} | {'per step: linear':>17} {'attention':>11} {'minutes':>8} | {a.steps} steps")
+    gpu = a.gpu_tflops * 1e12
+    print(f"{'clip':>6} {'tokens':>8} {'latent T':>9} | {'per step: linear':>17} {'attention':>11} {'minutes':>8} | {a.steps} steps" + (f" | GPU min/step, {a.steps} steps" if gpu else ""))
     for dur in (4, 5, 10, 15):
         n, lt, pf = tokens(dur)
         for name, p in (("gated", 17.4e9),):
             lin, att = step_flops(n, p)
             t = (lin + att) / rate
-            print(f"{dur:>5}s {n:>8} {lt:>9} | {lin/1e12:>14.0f} TF {att/1e12:>8.0f} TF {t/60:>8.1f} | {t*a.steps/3600:>6.1f} h")
+            line = f"{dur:>5}s {n:>8} {lt:>9} | {lin/1e12:>14.0f} TF {att/1e12:>8.0f} TF {t/60:>8.1f} | {t*a.steps/3600:>6.1f} h"
+            if gpu:
+                tg = (lin + att) / gpu + 17.4e9 / 12e9      # + the weights over PCIe 3 once a step
+                line += f" | {tg/60:>6.1f} min, {tg*a.steps/3600:>5.1f} h"
+            print(line)
     print("\n(attention is the quadratic term: it overtakes the linear layers near 20k tokens)")
 
 if __name__ == "__main__":
