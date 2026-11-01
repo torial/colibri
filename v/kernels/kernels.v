@@ -8,6 +8,7 @@ module kernels
 // Differences from the engines: none in the numbers (bit-identical, see tests/kern_diff); the in-place,
 // caller-owned output buffers and strided variants of the C API are reached through the `_into` functions.
 import math
+import gguf
 
 #flag @VMODROOT/kernels/libcolikern.a
 #flag -fopenmp
@@ -170,6 +171,11 @@ pub fn matmul_mxfp4(x []f32, q4 []u8, e8s []u8, s int, i int, o int) ![]f32 {
 // gq_row_bytes: bytes of a row of n elements of ggml type t, -1 if n is not whole blocks
 pub fn gq_row_bytes(t int, n i64) i64 {
 	return C.coli_k_gq_row_bytes(t, n)
+}
+
+// gq_type_name: the ggml type's name ("Q4_K"), "?" for an unknown id
+pub fn gq_type_name(t int) string {
+	return gguf.gq_type_name(t)
 }
 
 // gq_has_int: the type has an integer (quantized-activation) matmul path

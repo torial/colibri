@@ -24,8 +24,8 @@ SIMD / OpenMP matmul and attention kernels, the GGUF dequantizers, CUDA / Vulkan
 
 ## The first engine
 
-`olmoe` is OLMoE end to end in V on the pieces above. What it leaves to C: SIMD matmuls (`kernels`). What it does not
-have yet: GGUF checkpoints, sampling beyond greedy / chat / serve (`sample` and `tokenizer` are there to build them on),
+`olmoe` is OLMoE end to end in V on the pieces above. What it leaves to C: SIMD matmuls (`kernels`). GGUF checkpoints work (bit-identical to the C engine reading the file's rows, `OLM_ILV16=0`; its default repack to 16-row groups sums in another order). What it does not
+have yet: sampling beyond greedy / chat / serve (`sample` and `tokenizer` are there to build them on),
 the expert prefetch pilot and hot-expert pinning, multi-threaded attention, the GPU chains. Its logits are the C engine's
 bits only when V's generated C is compiled with the engine's flags (`-cflags "-O3 -march=..."`): FMA contraction in loops
 like `ctx += a * v` changes the last bit otherwise (the first run, without the flags, differed by ~1e-6 on every logit and

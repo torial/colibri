@@ -93,20 +93,37 @@ struct Expert {
 	gs []f32
 	us []f32
 	ds []f32
+	// a GGUF's expert: the three matrices as ggml blocks, with their ggml types
+	g  []u8
+	u  []u8
+	dn []u8
+	gt int
+	ut int
+	dt int
 mut:
 	used u64
+}
+
+// a dense matrix [rows, cols]: f32 in memory (the checkpoint's F32 / BF16 / F16), or a GGUF's ggml blocks as the
+// file holds them (`g`, of ggml type `t`), multiplied by the ggml kernels with the activations quantized to int8
+struct Mat {
+	f    []f32
+	g    []u8
+	t    int
+	rows int
+	cols int
 }
 
 struct Layer {
 	in_ln   []f32
 	post_ln []f32
-	q       []f32
-	k       []f32
-	v       []f32
-	o       []f32
+	q       Mat
+	k       Mat
+	v       Mat
+	o       Mat
 	qn      []f32
 	kn      []f32
-	gate    []f32
+	gate    Mat
 }
 
 pub struct Model {
@@ -119,8 +136,9 @@ pub mut:
 	miss       u64
 	cache_cap  int // experts kept per layer
 	store      safetensors.Store
-	embed      []f32
-	lm_head    []f32
+	embed      Mat
+	lm_head    Mat
+	gx         bool // routed experts are a GGUF's ggml tensors (gate_proj / up_proj / down_proj), not merged int8
 	final_norm []f32
 	layers     []Layer
 	kcache     [][]f32 // [layer][head][t][hd]
@@ -142,6 +160,36 @@ fn (m &Model) load_t(name string, rows i64, columns i64) ![]f32 {
 	return m.store.read_f32(name)!
 }
 
+// load_mat is load_t for a matrix a GGUF may hold in ggml blocks
+fn (m &Model) load_mat(name string, rows i64, columns i64) !Mat {
+	t := m.store.find(name) or { return error('missing ${name}') }
+	if t.is_ggml() {
+		rb := kernels.gq_row_bytes(t.ggml, columns)
+		if t.shape.len != 2 || t.shape[0] != rows || t.shape[1] != columns || rb < 0 || t.nbytes != rb * rows {
+			return error('${name}: not [${rows}, ${columns}] in ggml type ${kernels.gq_type_name(t.ggml)}, refusing (untrusted container)')
+		}
+		return Mat{
+			g:    m.store.read_raw(name)!
+			t:    t.ggml
+			rows: int(rows)
+			cols: int(columns)
+		}
+	}
+	return Mat{
+		f:    m.load_t(name, rows, columns)!
+		rows: int(rows)
+		cols: int(columns)
+	}
+}
+
+// mm: y[S,O] = x[S,I] . W^T
+fn (m &Model) mm(x []f32, s_n int, w &Mat) ![]f32 {
+	if w.g.len > 0 {
+		return kernels.gq_matmul(x, w.g, w.t, s_n, w.cols, w.rows)
+	}
+	return kernels.matmul_f32(x, w.f, s_n, w.cols, w.rows)
+}
+
 // open loads the dense weights of the checkpoint in `dir`; `cap` experts per layer stay in the cache
 pub fn open(dir string, cap int) !Model {
 	c := load_cfg(dir)!
@@ -151,21 +199,22 @@ pub fn open(dir string, cap int) !Model {
 		store:     safetensors.open(dir)!
 	}
 	d := i64(c.hidden)
-	m.embed = m.load_t('model.embed_tokens.weight', c.vocab, d)!
-	m.lm_head = m.load_t('lm_head.weight', c.vocab, d)!
+	m.embed = m.load_mat('model.embed_tokens.weight', c.vocab, d)!
+	m.lm_head = m.load_mat('lm_head.weight', c.vocab, d)!
+	m.gx = m.store.has('model.layers.0.mlp.experts.0.gate_proj.weight')
 	m.final_norm = m.load_t('model.norm.weight', d, 0)!
 	for i in 0 .. c.n_layers {
 		p := 'model.layers.${i}.'
 		m.layers << Layer{
 			in_ln:   m.load_t(p + 'input_layernorm.weight', d, 0)!
 			post_ln: m.load_t(p + 'post_attention_layernorm.weight', d, 0)!
-			q:       m.load_t(p + 'self_attn.q_proj.weight', d, d)!
-			k:       m.load_t(p + 'self_attn.k_proj.weight', d, d)!
-			v:       m.load_t(p + 'self_attn.v_proj.weight', d, d)!
-			o:       m.load_t(p + 'self_attn.o_proj.weight', d, d)!
+			q:       m.load_mat(p + 'self_attn.q_proj.weight', d, d)!
+			k:       m.load_mat(p + 'self_attn.k_proj.weight', d, d)!
+			v:       m.load_mat(p + 'self_attn.v_proj.weight', d, d)!
+			o:       m.load_mat(p + 'self_attn.o_proj.weight', d, d)!
 			qn:      m.load_t(p + 'self_attn.q_norm.weight', d, 0)!
 			kn:      m.load_t(p + 'self_attn.k_norm.weight', d, 0)!
-			gate:    m.load_t(p + 'mlp.gate.weight', c.n_experts, d)!
+			gate:    m.load_mat(p + 'mlp.gate.weight', c.n_experts, d)!
 		}
 		m.cache << map[int]&Expert{}
 	}
@@ -258,6 +307,9 @@ fn (mut m Model) expert(layer int, eid int) !&Expert {
 	}
 	m.miss++
 	c := &m.c
+	if m.gx {
+		return m.expert_gx(layer, eid)
+	}
 	ng := i64(c.inter) * c.hidden
 	nd := i64(c.hidden) * c.inter
 	want_w := ng + ng + nd
@@ -300,11 +352,74 @@ fn (mut m Model) expert(layer int, eid int) !&Expert {
 	return e
 }
 
+// ggml_type_of: the ggml type a tensor is held in: its block type, or the float type of a plain F32 / F16 / BF16
+fn ggml_type_of(t &safetensors.Tensor) int {
+	if t.is_ggml() {
+		return t.ggml
+	}
+	return match t.dtype {
+		.f32 { 0 }
+		.f16 { 1 }
+		.bf16 { 30 }
+		else { -1 }
+	}
+}
+
+fn (mut m Model) read_gx(layer int, eid int, kind string, rows i64, cols i64) !([]u8, int) {
+	nm := 'model.layers.${layer}.mlp.experts.${eid}.${kind}.weight'
+	t := m.store.find(nm) or { return error('missing ${nm}') }
+	typ := ggml_type_of(t)
+	rb := if typ >= 0 { kernels.gq_row_bytes(typ, cols) } else { i64(-1) }
+	if typ < 0 || rb < 0 || t.nbytes != rb * rows {
+		return error('${nm}: not ${rows} rows of ${cols} in a ggml type')
+	}
+	return m.store.read_raw(nm)!, typ
+}
+
+// expert_gx reads a GGUF's expert: three tensors of ggml blocks
+fn (mut m Model) expert_gx(layer int, eid int) !&Expert {
+	c := &m.c
+	g, gt := m.read_gx(layer, eid, 'gate_proj', c.inter, c.hidden)!
+	u, ut := m.read_gx(layer, eid, 'up_proj', c.inter, c.hidden)!
+	dn, dt := m.read_gx(layer, eid, 'down_proj', c.hidden, c.inter)!
+	e := &Expert{
+		g:    g
+		u:    u
+		dn:   dn
+		gt:   gt
+		ut:   ut
+		dt:   dt
+		used: m.clock
+	}
+	if m.cache[layer].len >= m.cache_cap {
+		mut victim := -1
+		mut oldest := u64(0xffffffffffffffff)
+		for k, v in m.cache[layer] {
+			if v.used < oldest {
+				oldest = v.used
+				victim = k
+			}
+		}
+		m.cache[layer].delete(victim)
+	}
+	m.cache[layer][eid] = e
+	return e
+}
+
 // expert_row: out[D] = down(silu(gate(x)) * up(x)) for one row
 fn (m &Model) expert_row(e &Expert, xs []f32) ![]f32 {
 	c := &m.c
 	d := c.hidden
 	ii := c.inter
+	if m.gx {
+		mut g := kernels.gq_matmul(xs, e.g, e.gt, 1, d, ii)!
+		u := kernels.gq_matmul(xs, e.u, e.ut, 1, d, ii)!
+		for i in 0 .. ii {
+			gv := g[i]
+			g[i] = (gv / (f32(1.0) + C.expf(-gv))) * u[i]
+		}
+		return kernels.gq_matmul(g, e.dn, e.dt, 1, ii, d)
+	}
 	ng := ii * d
 	mut g := kernels.olm_matmul_q(xs, unsafe { e.w[..ng] }, e.gs, d, ii)!
 	u := kernels.olm_matmul_q(xs, unsafe { e.w[ng..2 * ng] }, e.us, d, ii)!
@@ -362,7 +477,7 @@ fn (mut m Model) moe(layer int, x []f32, s_n int) ![]f32 {
 	c := &m.c
 	d := c.hidden
 	e_n := c.n_experts
-	logits := kernels.matmul_f32(x, m.layers[layer].gate, s_n, d, e_n)!
+	logits := m.mm(x, s_n, &m.layers[layer].gate)!
 	mut out := []f32{len: s_n * d}
 	for s in 0 .. s_n {
 		mut pr := unsafe { logits[s * e_n..(s + 1) * e_n] }.clone()
@@ -387,9 +502,9 @@ fn (mut m Model) attention(layer int, x []f32, s_n int, pos_base int) ![]f32 {
 	hd := c.head_dim
 	d := c.hidden
 	l := &m.layers[layer]
-	mut q := kernels.matmul_f32(x, l.q, s_n, d, d)!
-	mut k := kernels.matmul_f32(x, l.k, s_n, d, d)!
-	mut vv := kernels.matmul_f32(x, l.v, s_n, d, d)!
+	mut q := m.mm(x, s_n, &l.q)!
+	mut k := m.mm(x, s_n, &l.k)!
+	mut vv := m.mm(x, s_n, &l.v)!
 	for s in 0 .. s_n {
 		qsrc := q[s * d..(s + 1) * d].clone()
 		rmsnorm_row(mut q, s * d, qsrc, 0, l.qn, d, c.eps)
@@ -442,7 +557,7 @@ fn (mut m Model) attention(layer int, x []f32, s_n int, pos_base int) ![]f32 {
 			}
 		}
 	}
-	return kernels.matmul_f32(ctx, l.o, s_n, d, d)
+	return m.mm(ctx, s_n, &l.o)
 }
 
 // step feeds `ids` (S tokens at positions pos_base..) through the layers and returns the logits of the last
@@ -456,8 +571,16 @@ fn (mut m Model) step(ids []int, pos_base int) ![]f32 {
 		if id < 0 || id >= c.vocab {
 			return error('token id ${id} outside the vocabulary of ${c.vocab}')
 		}
-		for j in 0 .. d {
-			x[s * d + j] = m.embed[id * d + j]
+		if m.embed.g.len > 0 {
+			rb := kernels.gq_row_bytes(m.embed.t, d)
+			row := kernels.gq_dequant_row(m.embed.t, unsafe { m.embed.g[i64(id) * rb..(i64(id) + 1) * rb] }, d)!
+			for j in 0 .. d {
+				x[s * d + j] = row[j]
+			}
+		} else {
+			for j in 0 .. d {
+				x[s * d + j] = m.embed.f[id * d + j]
+			}
 		}
 	}
 	mut nrm := []f32{len: s_n * d}
@@ -480,7 +603,7 @@ fn (mut m Model) step(ids []int, pos_base int) ![]f32 {
 	}
 	mut last := []f32{len: d}
 	rmsnorm_row(mut last, 0, x, (s_n - 1) * d, m.final_norm, d, c.eps)
-	logit := kernels.matmul_f32(last, m.lm_head, 1, d, c.vocab)!
+	logit := m.mm(last, 1, &m.lm_head)!
 	if m.keep {
 		m.logits << logit.clone()
 	}
