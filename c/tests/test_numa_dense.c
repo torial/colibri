@@ -32,6 +32,23 @@ int main(void){
     int bound=0; FILE *f=fopen("/proc/self/numa_maps","r");
     if(f){ char line[1024]; while(fgets(line,sizeof line,f)){ unsigned long a;
         if(sscanf(line,"%lx",&a)==1 && a>=(unsigned long)p && a<(unsigned long)p+n && strstr(line,"bind:0")) bound=1; } fclose(f); }
+    { /* COLI_NUMA=3: expert segments in file order, and the VMA budget */
+      int64_t nb[3]={3<<20,1<<20,2<<20}, of[3]={300,100,200}, sg[3];
+      numa_expert_segments(nb,of,sg);
+      assert(sg[0]==(1<<20) && sg[1]==(2<<20) && sg[2]==(3<<20));
+      g_numa_mode=3; g_numa_skip_bind=0;
+      numa_vma_budget_init(5165,0);              /* 0.8*5165-4096 = 36 VMAs: three slabs at 12 each */
+      assert(g_numa_vma_budget==36);
+      size_t ws=(size_t)12<<20; char *arena=mmap(NULL,ws*6,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+      assert(arena!=MAP_FAILED);
+      int64_t seg3[3]={4<<20,4<<20,4<<20}; int e=0;
+      while(e<6 && numa_expert_bind_blocked(arena+(size_t)e*ws,ws,seg3)) e++;
+      assert(e==3 && g_numa_blocked_slabs==3 && g_numa_binds==9 && g_numa_interleaved_slabs==1 && g_numa_vma_budget==0);
+      numa_slab_bind(arena+(size_t)e*ws,(size_t)(6-e)*ws);   /* the arena's tail, interleaved in one piece */
+      for(size_t i=0;i<ws*6;i+=4096) arena[i]=1;
+      g_numa_mode=2;                                         /* below 3 nothing is blocked */
+      assert(numa_expert_bind_blocked(arena,ws,seg3)==0);
+      munmap(arena,ws*6); }
     printf("numa_dense: ok (cut checked; bind policy %s in numa_maps)\n",bound?"seen":"not visible here");
 #endif
     return 0;

@@ -1783,6 +1783,69 @@ static void numa_dense_bind(void *p, size_t n){
     (void)p;(void)n;
 #endif
 }
+/* ---- COLI_NUMA=3: the expert slabs bound the same way, one tensor at a time ----
+ * An expert's matmuls are `omp parallel for schedule(static)` over the rows of one tensor at a time
+ * (gate, then up, then down; the slab holds them back to back in file order), so, as for the dense
+ * trunk, thread t reads the same slice of each tensor and the slice can be made local. That means
+ * three tensors x one piece per node = up to 6 mbind policies, ~6 VMAs, per slab, where the
+ * interleave costs one per slab or per arena (#419): a PIN_GB=all model has ~19,456 experts and
+ * would cross the default vm.max_map_count of 65530. So every blocked slab is paid out of a budget
+ * read from /proc/sys/vm/max_map_count (80% of it, less the VMAs already in use); a slab the budget
+ * cannot pay for stays interleaved, and the log says once to raise the limit
+ * (`sysctl -w vm.max_map_count=1048576`). Scales (1/16-1/64 of the bytes) stay interleaved.
+ * Experimental, untested on a real multi-socket host. */
+#ifdef __linux__
+static long g_numa_vma_budget=-1;               /* VMAs this mode may still create; -1 = not read yet */
+static int g_numa_vma_warned=0;
+#endif
+static long g_numa_binds=0, g_numa_blocked_slabs=0, g_numa_interleaved_slabs=0;   /* counters (tests, log) */
+static void numa_vma_budget_init(long max_map_count, long in_use){
+#ifdef __linux__
+    long b=(long)(max_map_count*0.8)-in_use-4096;      /* 4096: room for the rest of the process */
+    g_numa_vma_budget=b>0?b:0;
+#else
+    (void)max_map_count;(void)in_use;
+#endif
+}
+/* the three tensors' weight bytes of one expert in file order (the order the slab holds them) */
+static void numa_expert_segments(const int64_t nbytes[3], const int64_t off[3], int64_t seg[3]){
+    int ord[3]={0,1,2};
+    for(int a=0;a<3;a++) for(int b=a+1;b<3;b++) if(off[ord[b]]<off[ord[a]]){ int t=ord[a]; ord[a]=ord[b]; ord[b]=t; }
+    for(int k=0;k<3;k++) seg[k]=nbytes[ord[k]];
+}
+/* bind one expert slab with its three tensors blocked by node: returns 1 when it did, 0 when the
+ * mode is off or the VMA budget is spent (the caller then interleaves, whole slab or whole arena) */
+static int numa_expert_bind_blocked(void *slab, size_t cap, const int64_t seg[3]){
+#ifdef __linux__
+    if(g_numa_mode>=3 && g_numa_dn>=2 && !g_numa_skip_bind && slab){
+        if(g_numa_vma_budget<0){                       /* first use: read the limit and what is in use */
+            long mx=65530, used=0; FILE *f=fopen("/proc/sys/vm/max_map_count","r");
+            if(f){ if(fscanf(f,"%ld",&mx)!=1) mx=65530; fclose(f); }
+            f=fopen("/proc/self/maps","r");
+            if(f){ int ch; while((ch=fgetc(f))!=EOF) if(ch=='\n') used++; fclose(f); }
+            numa_vma_budget_init(mx,used);
+        }
+        long need=(long)g_numa_dn*3*2;                 /* pieces x tensors x 2 VMAs of slack each */
+        if(g_numa_vma_budget>=need){
+            g_numa_vma_budget-=need;
+            size_t o=0;
+            for(int k=0;k<3;k++){
+                if(seg[k]>=(1<<18) && o+(size_t)seg[k]<=cap) { numa_dense_bind((char*)slab+o,(size_t)seg[k]); g_numa_binds++; }
+                o+=(size_t)seg[k];
+            }
+            g_numa_blocked_slabs++;
+            return 1;
+        }
+        if(!g_numa_vma_warned){ g_numa_vma_warned=1;
+            fprintf(stderr,"[NUMA] expert slabs: %ld blocked, the vm.max_map_count budget is spent; the rest stay interleaved "
+                           "(sysctl -w vm.max_map_count=1048576 to block them all)\n",g_numa_blocked_slabs); }
+        g_numa_interleaved_slabs++;
+    }
+#else
+    (void)slab;(void)cap;(void)seg;
+#endif
+    return 0;
+}
 static void numa_init(void){
 #ifdef __linux__
     if(!getenv("COLI_NUMA")||!atoi(getenv("COLI_NUMA"))) return;
@@ -1813,7 +1876,7 @@ static void numa_init(void){
         if(coli_topo_load(&tp,"/sys",coli_topo_allowed_mask(am)) && tp.nnodes>=2){
             g_numa_dn=tp.nnodes; g_numa_dtotal=0;
             for(int k=0;k<tp.nnodes;k++){ g_numa_dnode[k]=tp.node_id[k]; g_numa_dcores[k]=tp.node_cores[k]; g_numa_dtotal+=tp.node_cores[k]; }
-            fprintf(stderr,"[NUMA] dense tensors (>=2 MB) bound by thread block:");
+            fprintf(stderr,"[NUMA] dense tensors (>=2 MB) bound by thread block%s:",g_numa_mode>=3?", expert slabs by tensor (vm.max_map_count budgeted)":"");
             for(int k=0;k<tp.nnodes;k++) fprintf(stderr," node%d=%d cores",tp.node_id[k],tp.node_cores[k]);
             const char *pl=getenv("OMP_PLACES");
             fprintf(stderr,"%s\n",(pl&&*pl&&*pl!='c')?"" :"  [WARNING: OMP_PLACES is not the node-ordered list; threads and blocks may not line up]");
@@ -3654,7 +3717,9 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
         compat_aligned_free(s->slab);
         if(posix_memalign((void**)&s->slab,4096,wtot+8192)){fprintf(stderr,"OOM slab\n"); if(fatal) exit(1); s->slab=NULL; s->slab_cap=0; return -1;}
         s->slab_cap=wtot+8192;
-        numa_slab_bind(s->slab,(size_t)s->slab_cap);
+        { int64_t nb3[3]={tw[0]->nbytes,tw[1]->nbytes,tw[2]->nbytes}, of3[3]={tw[0]->off,tw[1]->off,tw[2]->off}, sg[3];
+          numa_expert_segments(nb3,of3,sg);
+          if(!numa_expert_bind_blocked(s->slab,(size_t)s->slab_cap,sg)) numa_slab_bind(s->slab,(size_t)s->slab_cap); }
 #endif
     }
     /* The scales migrate with their weights, so they shrink on the same rule (#856).
@@ -12988,13 +13053,13 @@ static void pin_arena_bind(Model *m, PinRec *r, int *slot_of, int from, int to){
     const char suf[3][16]={"gate_proj","up_proj","down_proj"};  /* bounded suf: see #484 */
     for(int l=0;l<NR;l++){
         if(cnt[l]<2) continue;
-        int64_t wtot=0, qtot=0; int ok=1;
+        int64_t wtot=0, qtot=0; int ok=1; int64_t nb3[3]={0,0,0}, of3[3]={0,0,0};
         for(int k=0;k<3 && ok;k++){
             char nm[288],qn[320];
             snprintf(nm,sizeof nm,"model.layers.%d.mlp.experts.%d.%s.weight",l,r[first[l]].e,suf[k]);
             snprintf(qn,sizeof qn,"%s.qs",nm);
             st_tensor *tw=st_find(&m->S,nm), *tq=st_find(&m->S,qn);
-            if(!tw||!tq) ok=0; else { wtot+=tw->nbytes; qtot+=tq->nbytes; }
+            if(!tw||!tq) ok=0; else { wtot+=tw->nbytes; qtot+=tq->nbytes; nb3[k]=tw->nbytes; of3[k]=tw->off; }
         }
         if(!ok) continue;                     /* unquantized fallback: individual allocs */
         size_t ws=((size_t)wtot+8192+4095)&~(size_t)4095;
@@ -13002,7 +13067,10 @@ static void pin_arena_bind(Model *m, PinRec *r, int *slot_of, int from, int to){
         uint8_t *aw=NULL; float *af=NULL;
         if(posix_memalign((void**)&aw,4096,(size_t)cnt[l]*ws)) continue;
         if(posix_memalign((void**)&af,4096,(size_t)cnt[l]*fs)){ free(aw); continue; }
-        numa_slab_bind(aw,(size_t)cnt[l]*ws);
+        { int64_t sg[3]; numa_expert_segments(nb3,of3,sg);       /* COLI_NUMA=3: slab by slab while the VMA budget lasts, */
+          int e=0;                                              /* the rest of the arena interleaved in one piece */
+          while(e<cnt[l] && numa_expert_bind_blocked(aw+(size_t)e*ws,ws,sg)) e++;
+          if(e<cnt[l]) numa_slab_bind(aw+(size_t)e*ws,(size_t)(cnt[l]-e)*ws); }
         numa_slab_bind(af,(size_t)cnt[l]*fs);
         int i=0;
         for(int a=from;a<to;a++){
