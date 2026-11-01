@@ -32,7 +32,7 @@ bits only when V's generated C is compiled with the engine's flags (`-cflags "-O
 like `ctx += a * v` changes the last bit otherwise (the first run, without the flags, differed by ~1e-6 on every logit and
 agreed on every token).
 
-`glm` is the GLM-5.2 engine's f32 path (MLA, sigmoid router with selection bias, shared expert). It is the first engine checked to tolerance rather than to the bit in every case: where the bits differ the logits agree to ~1e-6 and the tokens are identical; the shape-dependent summation-order difference (seen when kv_lora + qk_rope is not a multiple of 4, and in a few aligned cases) is open. Quantized GLM (int8 / int4) is the next step toward running the real model.
+`glm` is the GLM-5.2 engine's f32 path (MLA, sigmoid router with selection bias, shared expert). It is the first engine checked to tolerance rather than to the bit in every case: where the bits differ the logits agree to ~1e-6 and the tokens are identical; the remaining last-bit differences come from how C's compiler fuses or unrolls the scalar RoPE-key dot loop for short, odd lengths (shown by an experiment: forcing `fmaf` in V flips which shapes match); a rotary width that is a multiple of 8, like real GLM's 64, matches. Quantized GLM (int8 / int4) is the next step toward running the real model.
 
 Next engines, each checked the same way against its C original on a tiny model: the dense-attention families share most of
 what `olmoe` has; GLM / DeepSeek need MLA attention and expert streaming from `c/*_chain.h`.
