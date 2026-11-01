@@ -4,6 +4,8 @@
 set -eu
 cd "$(dirname "$0")"; k=${1:-1}
 v test cjson safetensors gguf tokenizer sample
+kernels/build.sh
+v -cc gcc test kernels
 tests/json_diff/run.sh $((3000 * k)) 1
 python3 tests/st_diff/run.py $((400 * k)) 1
 python3 tests/st_ext/run.py $((100 * k)) 1
@@ -15,4 +17,5 @@ gcc -O1 -I../c -o "$w/c_uni" tests/tok_diff/c_uni.c -lm; v -o "$w/v_uni" tests/t
 "$w/c_uni" > "$w/cu.txt"; "$w/v_uni" > "$w/vu.txt"
 cmp -s "$w/cu.txt" "$w/vu.txt" && echo "unicode classes: every code point identical" || { echo "unicode classes: DIFFERENT"; exit 1; }
 python3 tests/sample_diff/run.py $((300 * k)) 1
+python3 tests/kern_diff/run.py $((40 * k)) 1
 rm -rf "$w"
