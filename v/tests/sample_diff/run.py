@@ -3,6 +3,7 @@
 top-p values, bans, hostile (NaN / Inf) rows, and stop-set arming with and without a tokenizer.
 usage: run.py [cases per kind, default 300] [seed, default 1]"""
 import json, os, random, struct, subprocess, sys, tempfile
+SAN = ['-fsanitize=address,undefined', '-fno-sanitize-recover=undefined', '-g'] if os.environ.get('SAN') else []   # SAN=1: the C original under ASan + UBSan
 
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 300
 rnd = random.Random(int(sys.argv[2]) if len(sys.argv) > 2 else 1)
@@ -59,9 +60,11 @@ tj = {'added_tokens': added, 'pre_tokenizer': {'type': 'ByteLevel'}, 'model': {'
 with tempfile.TemporaryDirectory() as w:
     open(f'{w}/cases.txt', 'w').write('\n'.join(cases) + '\n')
     json.dump(tj, open(f'{w}/tokenizer.json', 'w'))
-    subprocess.check_call(['gcc', '-O1', '-w', '-I' + here + '/../../../c', '-o', f'{w}/c', f'{here}/c_dump.c', '-lm'])
+    subprocess.check_call(['gcc', '-O1', '-w'] + SAN + ['-I' + here + '/../../../c', '-o', f'{w}/c', f'{here}/c_dump.c', '-lm'])
     subprocess.check_call(['v', '-o', f'{w}/v', f'{here}/v_dump.v'], stdout=subprocess.DEVNULL)
-    co = subprocess.run([f'{w}/c', f'{w}/cases.txt', f'{w}/tokenizer.json'], capture_output=True, text=True, check=True).stdout.strip().split('\n')
+    co = subprocess.run([f'{w}/c', f'{w}/cases.txt', f'{w}/tokenizer.json'], capture_output=True, text=True)
+    if co.returncode: print('C ORIGINAL FAILED:', co.stderr[-1500:]); sys.exit(1)
+    co = co.stdout.strip().split('\n')
     vo = subprocess.run([f'{w}/v', f'{w}/cases.txt', f'{w}/tokenizer.json'], capture_output=True, text=True, check=True).stdout.strip().split('\n')
     if co != vo:
         for i, (a, b) in enumerate(zip(co, vo)):

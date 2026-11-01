@@ -4,10 +4,11 @@ lengths, offsets and shapes out of bounds, wrong dtypes, mismatched numel, NULs,
 dumpers; exit status and the dump of tensors and data hashes must be identical.
 usage: run.py [N cases] [seed]   (needs gcc and a V compiler on PATH)"""
 import json, os, random, shutil, struct, subprocess, sys, tempfile
+SAN = ['-fsanitize=address,undefined', '-fno-sanitize-recover=undefined', '-g'] if os.environ.get('SAN') else []   # SAN=1: the C original under ASan + UBSan
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 400; random.seed(int(sys.argv[2]) if len(sys.argv) > 2 else 1)
 here = os.path.dirname(os.path.abspath(__file__)); root = os.path.abspath(os.path.join(here, '..', '..', '..')); v_dir = os.path.join(root, 'v')
 w = tempfile.mkdtemp(prefix='st_diff.')
-subprocess.check_call(['gcc', '-O1', '-I' + os.path.join(root, 'c'), '-o', w + '/c_dump', here + '/c_dump.c', '-lm'])
+subprocess.check_call(['gcc', '-O1'] + SAN + [ '-I' + os.path.join(root, 'c'), '-o', w + '/c_dump', here + '/c_dump.c', '-lm'])
 subprocess.check_call(['v', '-o', w + '/v_dump', 'tests/st_diff/v_dump.v'], cwd=v_dir, stdout=subprocess.DEVNULL)
 ESZ = {'BF16': 2, 'F16': 2, 'F32': 4, 'U8': 1, 'I8': 1, 'F8_E4M3': 1, 'F8_E8M0': 1, 'I64': 8, 'I32': 4, 'U32': 4, 'U64': 8}
 def shard(tensors, meta=None, hlen_delta=0, pad=0, trunc=0, raw_header=None):

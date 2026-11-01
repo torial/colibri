@@ -5,11 +5,12 @@ real merges happen, plus added tokens), and many texts (words, digits, punctuati
 invalid UTF-8, added tokens) are encoded and decoded by both; every id and every decoded byte must agree.
 usage: run.py [texts per family] [seed]"""
 import json, os, random, shutil, subprocess, sys, tempfile
+SAN = ['-fsanitize=address,undefined', '-fno-sanitize-recover=undefined', '-g'] if os.environ.get('SAN') else []   # SAN=1: the C original under ASan + UBSan
 from collections import Counter
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 300; random.seed(int(sys.argv[2]) if len(sys.argv) > 2 else 1)
 here = os.path.dirname(os.path.abspath(__file__)); root = os.path.abspath(os.path.join(here, '..', '..', '..')); v_dir = os.path.join(root, 'v')
 w = tempfile.mkdtemp(prefix='tok_diff.')
-subprocess.check_call(['gcc', '-O1', '-I' + os.path.join(root, 'c'), '-o', w + '/c_dump', here + '/c_dump.c', '-lm'])
+subprocess.check_call(['gcc', '-O1'] + SAN + [ '-I' + os.path.join(root, 'c'), '-o', w + '/c_dump', here + '/c_dump.c', '-lm'])
 subprocess.check_call(['v', '-o', w + '/v_dump', 'tests/tok_diff/v_dump.v'], cwd=v_dir, stdout=subprocess.DEVNULL)
 # GPT-2 byte <-> unicode map
 bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256)); cs = bs[:]; n = 0

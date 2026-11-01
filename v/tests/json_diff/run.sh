@@ -4,7 +4,7 @@
 set -eu
 here=$(cd "$(dirname "$0")" && pwd); root=$here/../../..; w=${TMPDIR:-/tmp}/json_diff.$$; mkdir -p "$w"
 python3 "$here/gen_corpus.py" "$w/corpus" "${1:-3000}" "${2:-1}"
-gcc -O1 -I"$root/c" -o "$w/c_dump" "$here/c_dump.c" -lm
+gcc -O1 ${SAN:+-fsanitize=address,undefined -fno-sanitize-recover=undefined -g} -I"$root/c" -o "$w/c_dump" "$here/c_dump.c" -lm
 (cd "$here/../.." && v -o "$w/v_dump" tests/json_diff/v_dump.v) >/dev/null
 "$w/c_dump" "$w"/corpus/*.json > "$w/c.out"
 "$w/v_dump" "$w"/corpus/*.json > "$w/v.out"

@@ -22,3 +22,9 @@ Run the differential tests with a V compiler and gcc on PATH.
 `python3` and a V compiler on `PATH`. Modules that do not touch the compute kernels (`cjson`, `safetensors`, `gguf`,
 `tokenizer`, `sample`) build with V's default compiler; a program that imports `kernels` needs `v -cc gcc` and
 `kernels/build.sh` run first.
+
+## Sanitizers
+
+Every differential test can run the C original under AddressSanitizer + UndefinedBehaviorSanitizer: `SAN=1 ASAN_OPTIONS=detect_leaks=0
+python3 tests/st_ext/run.py 250 12` (likewise `st_diff`, `tok_diff`, `sample_diff`, and `SAN=1 tests/json_diff/run.sh`). The hostile
+corpora then double as a fuzzer for the C parsers; a sanitizer report in the C shows up as a mismatch.

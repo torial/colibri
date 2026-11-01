@@ -6,13 +6,14 @@ missing-tensor report). Each case: the tensor table and stamps from both, then a
 ending in at most one that is expected to be refused; exit status, stdout and stderr must be identical.
 usage: run.py [N cases] [seed]   (needs gcc and a V compiler on PATH)"""
 import difflib, importlib.util, json, os, random, shutil, struct, subprocess, sys, tempfile
+SAN = ['-fsanitize=address,undefined', '-fno-sanitize-recover=undefined', '-g'] if os.environ.get('SAN') else []   # SAN=1: the C original under ASan + UBSan
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 200
 R = random.Random(int(sys.argv[2]) if len(sys.argv) > 2 else 1)
 here = os.path.dirname(os.path.abspath(__file__)); root = os.path.abspath(os.path.join(here, '..', '..', '..')); v_dir = os.path.join(root, 'v')
 CHUNK = 4093            # a small pread chunk on both sides: every read goes through the chunk loop
 w = tempfile.mkdtemp(prefix='st_ext.', dir=os.environ.get('TMPDIR', '/tmp'))
 for tag, flags in (('small', ['-DST_PREAD_CHUNK=%d' % CHUNK]), ('big', [])):
-    subprocess.check_call(['gcc', '-O1', '-w'] + flags + ['-DST_GGUF', '-I' + os.path.join(root, 'c'), '-o', w + '/c_ext_' + tag, here + '/c_ext.c', '-lm'])
+    subprocess.check_call(['gcc', '-O1', '-w'] + flags + SAN + ['-DST_GGUF', '-I' + os.path.join(root, 'c'), '-o', w + '/c_ext_' + tag, here + '/c_ext.c', '-lm'])
 subprocess.check_call(['v', '-o', w + '/v_ext', 'tests/st_ext/v_ext.v'], cwd=v_dir, stdout=subprocess.DEVNULL)
 spec = importlib.util.spec_from_file_location('gen_gguf', here + '/gen_gguf.py'); gen_gguf = importlib.util.module_from_spec(spec); spec.loader.exec_module(gen_gguf)
 ESZ = {'BF16': 2, 'F16': 2, 'F32': 4, 'U8': 1, 'I8': 1, 'F8_E4M3': 1, 'F8_E8M0': 1, 'I64': 8, 'I32': 4, 'U32': 4, 'U64': 8}

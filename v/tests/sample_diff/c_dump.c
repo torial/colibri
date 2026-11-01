@@ -38,7 +38,7 @@ int main(int argc, char **argv){
             free(lo);
         } else if (kind[0] == 'T') {             /* T eos serve_batch all_stops ncfg ids... : stops without and with the tokenizer */
             int eos, sb, as, nc; if (fscanf(f, "%d %d %d %d", &eos, &sb, &as, &nc) != 4) return 3;
-            Cfg c; c.n_stop = nc; for (int i = 0; i < nc; i++) if (fscanf(f, "%d", &c.stop_ids[i]) != 1) return 3;
+            Cfg c; c.n_stop = nc; for (int i = 0; i < nc; i++) { int v; if (fscanf(f, "%d", &v) != 1) return 3; if (i < 64) c.stop_ids[i] = v; }   /* Cfg holds 64; sample.h never reads past what it has filled */
             static Tok T; static int loaded = 0; if (!loaded) { tok_load(&T, argv[2]); loaded = 1; }
             if (sb) setenv("SERVE", "1", 1); else unsetenv("SERVE");
             if (sb) setenv("SERVE_BATCH", "1", 1); else unsetenv("SERVE_BATCH");
