@@ -3,7 +3,7 @@
 # needs gcc, python3 and a V compiler on PATH.   usage: v/run_all.sh [cases scale, default 1]
 set -eu
 cd "$(dirname "$0")"; k=${1:-1}
-v test cjson safetensors tokenizer sample
+v test cjson safetensors gguf tokenizer sample
 tests/json_diff/run.sh $((3000 * k)) 1
 python3 tests/st_diff/run.py $((400 * k)) 1
 python3 tests/st_ext/run.py $((100 * k)) 1

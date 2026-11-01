@@ -4,6 +4,7 @@ module main
 import os
 import math
 import safetensors
+import gguf
 
 fn C.posix_memalign(memptr &voidptr, alignment u64, size u64) int
 
@@ -50,6 +51,13 @@ fn fnvf(f []f32) u64 {
 	return fnv(b)
 }
 
+fn d2bits(d f64) u64 {
+	if math.is_nan(d) {
+		return u64(0x7ff8000000000000)
+	}
+	return unsafe { *(&u64(&d)) }
+}
+
 fn die(msg string) {
 	if msg.ends_with('\n') {
 		eprint(msg)
@@ -74,10 +82,45 @@ fn main() {
 	}
 	for t in s.tensors {
 		shape := t.shape.map(it.str()).join(',')
-		println('T ${hex(t.name)} ${int(t.dtype)} ${t.off} ${t.nbytes} ${t.numel} ${t.shape.len} [${shape}] ${os.file_name(t.path)} ${t.shard}')
+		println('T ${hex(t.name)} ${t.dtype_code()} ${t.off} ${t.nbytes} ${t.numel} ${t.shape.len} [${shape}] ${os.file_name(t.path)} ${t.shard}')
 	}
 	for i in 0 .. s.fmt_names.len {
 		println('F ${hex(s.fmt_names[i])} ${hex(s.fmt_vals[i])}')
+	}
+	if s.gguf_active {
+		mut gs := [s.gguf_meta]
+		if !isnil(s.gguf_head) {
+			gs << s.gguf_head
+		}
+		for gi, g in gs {
+			println('G${gi} parts=${g.paths.len} kv=${g.kv.len} tensors=${g.t.len}')
+			for k in g.kv {
+				mut line := 'K ${hex(k.key)} ${k.typ}'
+				match k.typ {
+					gguf.t_u8, gguf.t_u16, gguf.t_u32, gguf.t_u64, gguf.t_bool {
+						line += ' u${k.u}'
+					}
+					gguf.t_i8, gguf.t_i16, gguf.t_i32, gguf.t_i64 { line += ' i${k.i}' }
+					gguf.t_f32, gguf.t_f64 { line += ' f${d2bits(k.f):016x}' }
+					gguf.t_string { line += ' s${hex(k.s)}' }
+					gguf.t_array {
+						line += ' a${k.atype} n${k.n}'
+						if k.atype == gguf.t_string {
+							for x in k.strs {
+								line += ' ${hex(x)}'
+							}
+						} else {
+							line += ' ${fnv(k.arr):016x}'
+						}
+					}
+					else {}
+				}
+				println(line)
+			}
+			for t in g.t {
+				println('GT ${hex(t.name)} ${t.typ} ${t.n_dims} ${t.ne[0]} ${t.ne[1]} ${t.ne[2]} ${t.ne[3]} ${t.file} ${t.off} ${t.nbytes}')
+			}
+		}
 	}
 	tok := os.read_file(os.args[3]) or { exit(2) }.fields()
 	mut p := 0
@@ -205,11 +248,13 @@ fn main() {
 					exit(5)
 				}
 				unsafe { C.memset(buf, 0xAB, total) }
-				s.read_range_rep(a, rep, off, nb, unsafe { &u8(buf) + pad + (if tok[p - 1] == '2' {
-					16
-				} else {
-					0
-				}) }, cap, drop, direct, 'rrep') or {
+				s.read_range_rep(a, rep, off, nb, unsafe {
+					&u8(buf) + pad + (if tok[p - 1] == '2' {
+						16
+					} else {
+						0
+					})
+				}, cap, drop, direct, 'rrep') or {
 					die('${err}')
 					return
 				}
@@ -262,6 +307,10 @@ fn main() {
 			'missing' {
 				n := unhex(tok[p])
 				p++
+				if s.has(n) {
+					println('present')
+					continue
+				}
 				s.read_raw(n) or {
 					die('${err}')
 					return

@@ -5,15 +5,16 @@ mirrors, and every reader (capped, scale, slices, physical and replica ranges wi
 missing-tensor report). Each case: the tensor table and stamps from both, then a generated list of operations
 ending in at most one that is expected to be refused; exit status, stdout and stderr must be identical.
 usage: run.py [N cases] [seed]   (needs gcc and a V compiler on PATH)"""
-import difflib, json, os, random, shutil, struct, subprocess, sys, tempfile
+import difflib, importlib.util, json, os, random, shutil, struct, subprocess, sys, tempfile
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 200
 R = random.Random(int(sys.argv[2]) if len(sys.argv) > 2 else 1)
 here = os.path.dirname(os.path.abspath(__file__)); root = os.path.abspath(os.path.join(here, '..', '..', '..')); v_dir = os.path.join(root, 'v')
 CHUNK = 4093            # a small pread chunk on both sides: every read goes through the chunk loop
 w = tempfile.mkdtemp(prefix='st_ext.', dir=os.environ.get('TMPDIR', '/tmp'))
 for tag, flags in (('small', ['-DST_PREAD_CHUNK=%d' % CHUNK]), ('big', [])):
-    subprocess.check_call(['gcc', '-O1', '-w'] + flags + ['-I' + os.path.join(root, 'c'), '-o', w + '/c_ext_' + tag, here + '/c_ext.c', '-lm'])
+    subprocess.check_call(['gcc', '-O1', '-w'] + flags + ['-DST_GGUF', '-I' + os.path.join(root, 'c'), '-o', w + '/c_ext_' + tag, here + '/c_ext.c', '-lm'])
 subprocess.check_call(['v', '-o', w + '/v_ext', 'tests/st_ext/v_ext.v'], cwd=v_dir, stdout=subprocess.DEVNULL)
+spec = importlib.util.spec_from_file_location('gen_gguf', here + '/gen_gguf.py'); gen_gguf = importlib.util.module_from_spec(spec); spec.loader.exec_module(gen_gguf)
 ESZ = {'BF16': 2, 'F16': 2, 'F32': 4, 'U8': 1, 'I8': 1, 'F8_E4M3': 1, 'F8_E8M0': 1, 'I64': 8, 'I32': 4, 'U32': 4, 'U64': 8}
 FLOAT = ('BF16', 'F16', 'F32')
 def hexs(s): return s.encode().hex()
@@ -33,15 +34,21 @@ def shard_bytes(tensors, meta=None, raw_header=None, pad=0):
 def write(d, name, blob):
     os.makedirs(d, exist_ok=True); open(os.path.join(d, name), 'wb').write(blob)
 
+SWEEP = [('bad', v) for v in gen_gguf.BAD_VARIANTS] + [('head', n) for n in gen_gguf.HEAD_STAGES] + [('bigsplit', None), ('names', None), ('names', None)]
 def build_case(k):
     """returns (primary, extra or None, mirrors [dirs], env, expect_note)"""
-    base = os.path.join(w, 'c%05d' % k); kind = R.choice(['out', 'many', 'plain', 'plain', 'split', 'overlay', 'stamps', 'stamps', 'overlay', 'mirror', 'mirror', 'big', 'nul'] + ['plain'] * 3)
+    base = os.path.join(w, 'c%05d' % k); kind = R.choice(['gguf'] * 6 + ['out', 'many', 'plain', 'plain', 'split', 'overlay', 'stamps', 'stamps', 'overlay', 'mirror', 'mirror', 'big', 'nul'] + ['plain'] * 3)
     prim = os.path.join(base, 'p'); extra = None; mirrors = []; env = {}
     if R.random() < .5: env['COLI_MAP_EXPERTS'] = '1'
     env['_KIND'] = kind
     small = R.random() < .5; env['_CHUNK'] = 'small' if small else 'big'
     if small: env['ST_CHUNK'] = str(CHUNK)
-    if kind == 'out':
+    sweep = SWEEP[k] if k < len(SWEEP) and N >= 2 * len(SWEEP) else None
+    if sweep: kind = 'gguf'
+    if kind == 'gguf':
+        gen_gguf.write_folder(R, prim, *(sweep or (None, None)))
+        if R.random() < .3: env['GGUF_CHECK'] = '1'
+    elif kind == 'out':
         for nm in R.choice([['out-00000', 'out-00001', 'out-00003'], ['out-00002', 'out-00003', 'out-mtp-1'], ['out-00001'], ['out-0', 'out-1', 'out-2']]):
             write(prim, nm + '.safetensors', shard_bytes([tensor('o.' + nm)]))
     elif kind == 'many':
@@ -103,7 +110,7 @@ def build_case(k):
         write(prim, 'model.safetensors', shard_bytes([], raw_header=raw) + payload(11))
     if kind in ('mirror', 'plain', 'big', 'split'):
         pass
-    if kind != 'many' and (kind == 'mirror' or R.random() < .25):
+    if kind not in ('many', 'gguf') and (kind == 'mirror' or R.random() < .25):
         for mi in range(R.choice([1, 2, 5])):
             md = os.path.join(base, 'm%d' % mi); os.makedirs(md, exist_ok=True); mirrors.append(md)
             for f in sorted(os.listdir(prim)) if os.path.isdir(prim) else []:
@@ -175,7 +182,7 @@ for k in range(N):
     open(base + '/empty.ops', 'w').write('')
     c = run(w + '/c_ext', prim, extra, base + '/empty.ops', env); v = run(w + '/v_ext', prim, extra, base + '/empty.ops', env)
     if c != v:
-        bad += 1; print('TABLE DIFFERENT', base, c[0], v[0]); print('\n'.join(list(difflib.unified_diff(c[2].decode().split('\n'), v[2].decode().split('\n'), 'C', 'V', lineterm=''))[:20]))
+        bad += 1; print('TABLE DIFFERENT', base, c[0], v[0]); print('\n'.join(list(difflib.unified_diff(c[2].decode().split('\n'), v[2].decode().split('\n'), 'C', 'V', lineterm=''))[:20])); print('\n'.join(list(difflib.unified_diff(c[1].decode().split('\n'), v[1].decode().split('\n'), 'C', 'V', lineterm='', n=0))[:14]))
         if bad >= 4: break
         continue
     if c[0] != 0:

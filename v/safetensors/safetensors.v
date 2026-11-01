@@ -8,18 +8,20 @@ module safetensors
 // (mirrors: accepted only when size and header are byte-identical), every reader (f32, scale sidecars,
 // raw, capped, tensor slices, physical ranges), the replica-aware O_DIRECT range read, prefetch and
 // readahead advice, whole-tensor and per-shard read-only mappings, and the diagnostic st.h prints when a
-// core tensor is missing. Where C calls exit(1) / coli_load_fail this returns an error carrying the
+// core tensor is missing, and GGUF folders. Where C calls exit(1) / coli_load_fail this returns an error carrying the
 // same text.
 // Differences: POSIX only (no Windows overlapped descriptors, no macOS F_NOCACHE twin); O_DIRECT twins
 // on Linux; the second descriptor st.h pairs with a shard on Windows is not needed; the chunk size of a
 // pread is a field (`pread_chunk`) rather than a compile-time macro; strings from the JSON are cut at an
-// embedded NUL as C strings are. GGUF folders (ST_GGUF) are in the gguf module.
+// embedded NUL as C strings are. GGUF folders (the ST_GGUF build) are always supported: st_gguf.v, over the
+// gguf module; `dequantizing` a ggml tensor stays with the C kernels of ggml_quants.h.
 // tests/st_diff compares the tensor table and the bytes read, shard by shard, against the C code;
 // tests/st_diff/run_ext.py does the same for the rest of the surface.
 import os
 import math
 import sync
 import cjson
+import gguf
 
 #flag -D_GNU_SOURCE
 #include <fcntl.h>
@@ -109,7 +111,8 @@ pub:
 	name   string
 	path   string // the shard that holds it
 	shard  int    // its index in Store.shards
-	off    i64    // absolute offset of the data in that file
+	ggml   int = -1 // a GGUF block-quantized tensor: its ggml type (dtype is then a placeholder); -1 otherwise
+	off    i64 // absolute offset of the data in that file
 	nbytes i64
 	dtype  Dtype
 	numel  i64
@@ -146,6 +149,9 @@ pub mut:
 	by_name     map[string]int
 	paths       []string
 	shards      []Shard
+	gguf_active bool // the store indexes a GGUF folder (gguf.json)
+	gguf_meta   &gguf.Ctx = unsafe { nil }
+	gguf_head   &gguf.Ctx = unsafe { nil }
 	n_overlay   int // names present in two shards, resolved by model.safetensors.index.json
 	pread_chunk i64 = i64(1) << 30
 	map_experts bool // COLI_MAP_EXPERTS: serve ranges from per-shard mappings
@@ -331,6 +337,11 @@ fn scan_dir(dir string, mut files []string) !int {
 }
 
 fn (mut s Store) open_fd(path string) !int {
+	for i, sh in s.shards {
+		if sh.path == path {
+			return i
+		}
+	}
 	fd := C.open(&char(path.str), C.O_RDONLY, 0)
 	if fd < 0 {
 		return error('${path}: ${errno_str()}')
@@ -369,6 +380,12 @@ pub fn open_multi(snap_dir string, extra_dirs string) !Store {
 		}
 	}
 	s.map_experts = os.getenv('COLI_MAP_EXPERTS').int() != 0
+	if s.init_gguf(snap_dir) or {
+		s.close()
+		return err
+	} {
+		return s
+	}
 	s.index(snap_dir, extra_dirs) or {
 		s.close()
 		return err
@@ -545,6 +562,12 @@ pub fn (mut s Store) close() {
 				C.munmap(b, u64(s.maps.len[i]))
 			}
 		}
+	}
+	if !isnil(s.gguf_meta) {
+		unsafe { s.gguf_meta.close() }
+	}
+	if !isnil(s.gguf_head) {
+		unsafe { s.gguf_head.close() }
 	}
 	s.shards = []Shard{}
 	s.tensors = []Tensor{}
@@ -844,7 +867,7 @@ pub fn (s &Store) read_scale_f32(name string, cap i64, drop bool) ![]f32 {
 		return s.read_f32_drop(name, drop)
 	}
 	if t.dtype != .f8_e8m0 {
-		return error('scale ${name}: dtype ${t.dtype.name()} is neither F32 nor F8_E8M0')
+		return error('scale ${name}: dtype ${t.dtype_label()} is neither F32 nor F8_E8M0')
 	}
 	if t.nbytes != t.numel {
 		return error('scale ${name}: F8_E8M0 numel ${t.numel} disagrees with ${t.nbytes} bytes')
@@ -1012,8 +1035,8 @@ pub fn (s &Store) read_slice(name string, byte_off i64, nbytes i64, drop bool) !
 // read_slice_f32: n_elems elements from element elem_off of a float tensor
 pub fn (s &Store) read_slice_f32(name string, elem_off i64, n_elems i64, drop bool) ![]f32 {
 	t := s.tensor(name)!
-	if int(t.dtype) >= 3 {
-		return error('slice ${name}: tensor is ${t.dtype.name()} — not a float tensor')
+	if t.dtype_code() >= 3 {
+		return error('slice ${name}: tensor is ${t.dtype_label()} — not a float tensor')
 	}
 	esz := i64(t.dtype.size())
 	if elem_off < 0 || n_elems < 0 || elem_off > t.numel || n_elems > t.numel - elem_off {

@@ -3,6 +3,7 @@
  * st.h and prints what each returned. A refusing operation exits like st.h does; the harness compares exit
  * status, stdout and stderr with the V side.
  * Build: gcc -O1 -I../../../c [-DST_PREAD_CHUNK=n] -o c_ext c_ext.c -lm   usage: c_ext dir extra|- ops */
+#define ST_GGUF 1
 #include "st.h"
 static void hex(const char *s){ for (; *s; s++) printf("%02x", (unsigned char)*s); }
 static uint64_t fnv(const unsigned char *b, size_t n){ uint64_t h = 14695981039346656037ULL; for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ULL; } return h; }
@@ -21,6 +22,24 @@ int main(int argc, char **argv){
         printf("] %s %d\n", base(S.paths[st_fidx(&S, t->fd)]), st_fidx(&S, t->fd));
     }
     for (int i = 0; i < S.fmt_n; i++) { printf("F "); hex(S.fmt_name[i]); printf(" "); hex(S.fmt_val[i]); printf("\n"); }
+    if (st_gguf_active) {
+        const gguf_ctx *Gs[2] = { &st_gguf_meta, st_gguf_head.n_files ? &st_gguf_head : NULL };
+        for (int gi = 0; gi < 2; gi++) { const gguf_ctx *G = Gs[gi]; if (!G) continue;
+            printf("G%d parts=%d kv=%d tensors=%d\n", gi, G->n_files, G->n_kv, G->n_tensors);
+            for (int i = 0; i < G->n_kv; i++) { const gguf_kv *k = &G->kv[i]; printf("K "); hex(k->key); printf(" %d", k->type);
+                switch (k->type) {
+                case GGUF_T_U8: case GGUF_T_U16: case GGUF_T_U32: case GGUF_T_U64: case GGUF_T_BOOL: printf(" u%llu", (unsigned long long)k->v.u); break;
+                case GGUF_T_I8: case GGUF_T_I16: case GGUF_T_I32: case GGUF_T_I64: printf(" i%lld", (long long)k->v.i); break;
+                case GGUF_T_F32: case GGUF_T_F64: { double d = k->v.f; uint64_t b; memcpy(&b, &d, 8); printf(" f%016llx", (unsigned long long)b); break; }
+                case GGUF_T_STRING: printf(" s"); hex(k->s ? k->s : ""); break;
+                case GGUF_T_ARRAY: printf(" a%d n%llu", k->atype, (unsigned long long)k->n);
+                    if (k->atype == GGUF_T_STRING) { for (uint64_t j = 0; j < k->n; j++) { printf(" "); hex(k->strs[j] ? k->strs[j] : ""); } }
+                    else printf(" %016llx", (unsigned long long)fnv((const unsigned char *)k->arr, (size_t)(k->n * (uint64_t)gguf_scalar_size(k->atype)))); break; }
+                printf("\n"); }
+            for (int i = 0; i < G->n_tensors; i++) { const gguf_tensor *t = &G->t[i]; printf("GT "); hex(t->name);
+                printf(" %d %d %lld %lld %lld %lld %d %llu %lld\n", t->type, t->n_dims, (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3], t->file, (unsigned long long)t->off, (long long)t->nbytes); }
+        }
+    }
     FILE *f = fopen(argv[3], "r"); if (!f) return 2;
     char op[32];
     while (fscanf(f, "%31s", op) == 1) {
@@ -85,7 +104,7 @@ int main(int argc, char **argv){
             int fd = (a >= 0 && a < S.nfd) ? S.fds[a] : -7;
             const void *p = st_map_shard_range(fd, b, c);
             printf("shardmap %s %016llx\n", p ? "yes" : "no", (unsigned long long)(p ? fnv(p, (size_t)c) : 0));
-        } else if (!strcmp(op, "missing")) { if (fscanf(f, "%2047s", nh) != 1) return 3; char *n = unhex(nh); st_read_raw(&S, n, NULL, 0);
+        } else if (!strcmp(op, "missing")) { if (fscanf(f, "%2047s", nh) != 1) return 3; char *n = unhex(nh); if (st_has(&S, n)) printf("present\n"); else st_read_raw(&S, n, NULL, 0);
         } else { fprintf(stderr, "unknown op %s\n", op); return 4; }
     }
     return 0;
