@@ -1524,6 +1524,10 @@ jev-sdk-check: mimo$(EXE) laya$(EXE) gliner_decide$(EXE) qwen36$(EXE) mimo-tiny-
 tests/test_qi_gemm$(EXE): tests/test_qi_gemm.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# qi_flash.h: blocked attention for long sequences against the naive double softmax (ragged shapes).
+tests/test_qi_flash$(EXE): tests/test_qi_flash.c qi_flash.h qi_gemm.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 # DeepSeek V4.1 Flash: one file, like every other portable engine. The fp4 experts
 # stream from the official checkpoint and quant.h's mxfp4 kernel reads them as they
 # are, so there is no conversion target here to go with it.
