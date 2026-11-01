@@ -1524,6 +1524,11 @@ jev-sdk-check: mimo$(EXE) laya$(EXE) gliner_decide$(EXE) qwen36$(EXE) mimo-tiny-
 tests/test_qi_gemm$(EXE): tests/test_qi_gemm.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# cuda_attn_f32.cu's indexing and chunking on a host emulator of the CUDA bits it uses (no GPU needed).
+.PHONY: cuda-attn-emu-test
+cuda-attn-emu-test: tests/test_cuda_attn_emu.cpp cuda_attn_f32.cu tests/cuda_emu.h
+	g++ -O1 -std=c++17 -pthread -I. -o tests/test_cuda_attn_emu $< && ./tests/test_cuda_attn_emu && rm -f tests/test_cuda_attn_emu
+
 # qi_flash.h: blocked attention for long sequences against the naive double softmax (ragged shapes).
 tests/test_qi_flash$(EXE): tests/test_qi_flash.c qi_flash.h qi_gemm.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
