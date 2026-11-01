@@ -37,6 +37,17 @@
     defined(__AVX512VNNI__) && defined(__AVX512VBMI__) && defined(__FMA__)
 #define GQ_VNNI512 1
 #endif
+/* AVX-512BW without VNNI or VBMI (Skylake-SP, Xeon Gold 6132): the interleaved (R16) kernels in
+ * 512-bit registers, with vpdpbusd built from vpmaddubsw + vpmaddwd (dpbusd512.h). The R16 kernels
+ * take their codes as u = w + BIAS: for BIAS < 128 the codes are <= 63, so a vpmaddubsw pair is at
+ * most 2*63*127 and cannot saturate; the Q8_0 / IQ4 / tile codes (w + 128, up to 255) would, so
+ * those go through |w| x sign(x, w) of the signed bytes instead (the same integer, no bias to
+ * take off). Not in this tier: Q2_0's multishift kernel and the row kernels (VBMI/VNNI only). */
+#include "dpbusd512.h"
+#if !defined(GQ_VNNI512) && defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__) && \
+    defined(__FMA__) && defined(COLI_IDOT_AVX512BW)
+#define GQ_BW512 1
+#endif
 /* |w| (unsigned) times sign(x, w), the four products of each int32 lane summed: one
  * vpdpbusd where AVX-VNNI or AVX-512 VL has it (Alder Lake, Zen 4), else maddubs then
  * madd with ones. Exact either way (a pair is at most 2*127*127 < 2^15), so the lanes
@@ -2031,21 +2042,36 @@ static int gq_r16_dequant_row(int t, const uint8_t *W, int64_t row, float *out, 
     }
     return 0;
 }
-#ifdef GQ_VNNI512
+#if defined(GQ_VNNI512) || defined(GQ_BW512)
 /* The kernels: 16 rows of one group (y[s * ystride + r]) against S <= 8 activation rows. */
 #define GQ_R16_ARGS float *y, int ystride, const uint8_t *grp, const int8_t *xq, const float *dx, const int32_t *xs, int I, const int S
 #define GQ_R16_FN static inline __attribute__((always_inline)) void
 #define GQ_R16_X4(xb, j) _mm512_set1_epi32(gq_ld32((xb) + 4 * (j)))
+#if defined(GQ_BW512)
+/* vpdpbusd(acc, codes, x) for BIAS < 128 (codes <= 63), and for BIAS 128 the signed-byte form:
+ * the codes are w + 128, so w = c ^ 0x80, and |w| x sign(x, w) needs no bias taken off afterwards */
+static inline __attribute__((always_inline)) __m512i gq_r16_dp(__m512i acc, __m512i c, __m512i x, const int bias) {
+    if (bias == 128) {
+        const __m512i w = _mm512_xor_si512(c, _mm512_set1_epi8((char)0x80));
+        return coli_dpbusd512(acc, _mm512_abs_epi8(w), _mm512_mask_sub_epi8(x, _mm512_movepi8_mask(w), _mm512_setzero_si512(), x));
+    }
+    return coli_dpbusd512(acc, c, x);
+}
+#define GQ_R16_SIGNED_BIAS 128
+#else
+#define gq_r16_dp(acc, c, x, bias) _mm512_dpbusd_epi32((acc), (c), (x))
+#define GQ_R16_SIGNED_BIAS (-1)
+#endif
 /* the 32 elements at index g32 (of 32) of the row: codes c[8] (quad j = elements 4j..4j+3),
  * sv the rows' scales, nv their mins (MIN), codes = w + BIAS */
 #define GQ_R16_ACC32(c, sv, MIN, nv, BIAS) \
     for (int s = 0; s < S; s++) { \
         const int8_t *xb_ = xq + (int64_t)s * I + 32 * (int64_t)g32; \
-        __m512i p_ = _mm512_dpbusd_epi32(_mm512_setzero_si512(), (c)[0], GQ_R16_X4(xb_, 0)); \
-        for (int j_ = 1; j_ < 8; j_++) p_ = _mm512_dpbusd_epi32(p_, (c)[j_], GQ_R16_X4(xb_, j_)); \
+        __m512i p_ = gq_r16_dp(_mm512_setzero_si512(), (c)[0], GQ_R16_X4(xb_, 0), (BIAS)); \
+        for (int j_ = 1; j_ < 8; j_++) p_ = gq_r16_dp(p_, (c)[j_], GQ_R16_X4(xb_, j_), (BIAS)); \
         const int32_t *x16_ = xs + (int64_t)s * (I / 16) + 2 * (int64_t)g32; const int32_t x32_ = x16_[0] + x16_[1]; \
         const float d_ = dx[(int64_t)s * (I / 32) + g32]; \
-        if ((BIAS) != 0) p_ = _mm512_sub_epi32(p_, _mm512_set1_epi32((BIAS) * x32_)); \
+        if ((BIAS) != 0 && (BIAS) != GQ_R16_SIGNED_BIAS) p_ = _mm512_sub_epi32(p_, _mm512_set1_epi32((BIAS) * x32_)); \
         acc[s] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(p_), _mm512_mul_ps((sv), _mm512_set1_ps(d_)), acc[s]); \
         if (MIN) acc[s] = _mm512_fnmadd_ps((nv), _mm512_set1_ps(d_ * (float)x32_), acc[s]); \
     }
@@ -2053,12 +2079,13 @@ static int gq_r16_dequant_row(int t, const uint8_t *W, int64_t row, float *out, 
 #define GQ_R16_ACC16(c, sv0, sv1, BIAS) \
     for (int s = 0; s < S; s++) { \
         const int8_t *xb_ = xq + (int64_t)s * I + 32 * (int64_t)g32; \
-        __m512i p0_ = _mm512_dpbusd_epi32(_mm512_setzero_si512(), (c)[0], GQ_R16_X4(xb_, 0)); \
-        __m512i p1_ = _mm512_dpbusd_epi32(_mm512_setzero_si512(), (c)[4], GQ_R16_X4(xb_, 4)); \
-        for (int j_ = 1; j_ < 4; j_++) { p0_ = _mm512_dpbusd_epi32(p0_, (c)[j_], GQ_R16_X4(xb_, j_)); \
-                                         p1_ = _mm512_dpbusd_epi32(p1_, (c)[4 + j_], GQ_R16_X4(xb_, 4 + j_)); } \
+        __m512i p0_ = gq_r16_dp(_mm512_setzero_si512(), (c)[0], GQ_R16_X4(xb_, 0), (BIAS)); \
+        __m512i p1_ = gq_r16_dp(_mm512_setzero_si512(), (c)[4], GQ_R16_X4(xb_, 4), (BIAS)); \
+        for (int j_ = 1; j_ < 4; j_++) { p0_ = gq_r16_dp(p0_, (c)[j_], GQ_R16_X4(xb_, j_), (BIAS)); \
+                                         p1_ = gq_r16_dp(p1_, (c)[4 + j_], GQ_R16_X4(xb_, 4 + j_), (BIAS)); } \
         const int32_t *x16_ = xs + (int64_t)s * (I / 16) + 2 * (int64_t)g32; \
-        p0_ = _mm512_sub_epi32(p0_, _mm512_set1_epi32((BIAS) * x16_[0])); p1_ = _mm512_sub_epi32(p1_, _mm512_set1_epi32((BIAS) * x16_[1])); \
+        if ((BIAS) != GQ_R16_SIGNED_BIAS) { \
+            p0_ = _mm512_sub_epi32(p0_, _mm512_set1_epi32((BIAS) * x16_[0])); p1_ = _mm512_sub_epi32(p1_, _mm512_set1_epi32((BIAS) * x16_[1])); } \
         const __m512 t_ = _mm512_fmadd_ps(_mm512_cvtepi32_ps(p1_), (sv1), _mm512_mul_ps(_mm512_cvtepi32_ps(p0_), (sv0))); \
         acc[s] = _mm512_fmadd_ps(t_, _mm512_set1_ps(dx[(int64_t)s * (I / 32) + g32]), acc[s]); \
     }
@@ -2263,7 +2290,7 @@ static void gq_tile16_rows(float *y, int ystride, const uint8_t *grp, const gq_a
 }
 #define GQ_TILE16_BIAS 128
 #endif
-#if !defined(GQ_VNNI512) && defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+#if !defined(GQ_VNNI512) && !defined(GQ_BW512) && defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
 /* The same forms on AVX2 (x86-64-v3, AVX-VNNI laptops): a group's 16 rows as two halves of
  * eight (a quad's 64 bytes: rows 0-7 then 8-15), one half at a time and up to four activation
  * rows a pass (16 ymm registers). Every lane runs the AVX-512 kernels' integer sum and float
@@ -2537,7 +2564,7 @@ static void gq_r16_rows(int t, float *y, int ystride, const uint8_t *grp, const 
     }
 }
 #endif
-#if defined(GQ_VNNI512) || defined(GQ_R16_AVX2)
+#if defined(GQ_VNNI512) || defined(GQ_BW512) || defined(GQ_R16_AVX2)
 #define GQ_R16_ON 1   /* the interleaved forms have kernels in this build: the engine may make them */
 #endif
 /* ---- File rows eight at a time (gq_rows_f8) ---------------------------------------

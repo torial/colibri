@@ -73,6 +73,49 @@ static void qi_pack_w(float *panel, const QiMat *W, int n0, int nr, int k0, int 
 /* acc[MR][NR] (+)= X[m0.., k0..k0+kc) . panel ; mr <= MR rows valid */
 static void qi_kernel(float *Y, int ldy, const float *X, int ldx, const float *panel,
                       int kc, int mr, int nr, int accumulate){
+#if defined(__AVX512F__) && defined(__FMA__) && defined(QI_AVX512)
+    /* One zmm a row: the 16 columns of the panel; half the FMA instructions of the AVX2 kernel below
+     * (6 a k instead of 12). OPT-IN (-DQI_AVX512): it pays only on a core with TWO 512-bit FMA units
+     * (Xeon Gold 6xxx / Platinum; the Gold 6132 has them) and not at all on one with a single unit
+     * (Silver, many Gold 5xxx, and the cloud VM this was written on, where it measured 47 GFLOP/s a
+     * thread against 57 for the AVX2 kernel: the same peak per cycle, a lower clock under AVX-512).
+     * Unmeasured on the target: build tests/test_qi_gemm both ways and run `test_qi_gemm bench`. */
+    if (mr == QI_MR) {
+        /* two k at a time into two sets of six accumulators: one FMA's latency is 4 cycles and the two
+         * 512-bit units need 8+ independent chains, a single set of six leaves them idle. The sets are
+         * added at the end, so the sum is the AVX2 kernel's up to the order of the additions. */
+        __m512 c0=_mm512_setzero_ps(), c1=_mm512_setzero_ps(), c2=_mm512_setzero_ps();
+        __m512 c3=_mm512_setzero_ps(), c4=_mm512_setzero_ps(), c5=_mm512_setzero_ps();
+        __m512 d0=_mm512_setzero_ps(), d1=_mm512_setzero_ps(), d2=_mm512_setzero_ps();
+        __m512 d3=_mm512_setzero_ps(), d4=_mm512_setzero_ps(), d5=_mm512_setzero_ps();
+        const float *x0 = X, *x1 = X + ldx, *x2 = X + 2*ldx, *x3 = X + 3*ldx, *x4 = X + 4*ldx, *x5 = X + 5*ldx;
+        int k = 0;
+        for (; k + 2 <= kc; k += 2) {
+            __m512 b = _mm512_loadu_ps(panel + k*QI_NR), e = _mm512_loadu_ps(panel + (k + 1)*QI_NR);
+            c0 = _mm512_fmadd_ps(_mm512_set1_ps(x0[k]), b, c0); d0 = _mm512_fmadd_ps(_mm512_set1_ps(x0[k+1]), e, d0);
+            c1 = _mm512_fmadd_ps(_mm512_set1_ps(x1[k]), b, c1); d1 = _mm512_fmadd_ps(_mm512_set1_ps(x1[k+1]), e, d1);
+            c2 = _mm512_fmadd_ps(_mm512_set1_ps(x2[k]), b, c2); d2 = _mm512_fmadd_ps(_mm512_set1_ps(x2[k+1]), e, d2);
+            c3 = _mm512_fmadd_ps(_mm512_set1_ps(x3[k]), b, c3); d3 = _mm512_fmadd_ps(_mm512_set1_ps(x3[k+1]), e, d3);
+            c4 = _mm512_fmadd_ps(_mm512_set1_ps(x4[k]), b, c4); d4 = _mm512_fmadd_ps(_mm512_set1_ps(x4[k+1]), e, d4);
+            c5 = _mm512_fmadd_ps(_mm512_set1_ps(x5[k]), b, c5); d5 = _mm512_fmadd_ps(_mm512_set1_ps(x5[k+1]), e, d5);
+        }
+        if (k < kc) {
+            __m512 b = _mm512_loadu_ps(panel + k*QI_NR);
+            c0 = _mm512_fmadd_ps(_mm512_set1_ps(x0[k]), b, c0); c1 = _mm512_fmadd_ps(_mm512_set1_ps(x1[k]), b, c1);
+            c2 = _mm512_fmadd_ps(_mm512_set1_ps(x2[k]), b, c2); c3 = _mm512_fmadd_ps(_mm512_set1_ps(x3[k]), b, c3);
+            c4 = _mm512_fmadd_ps(_mm512_set1_ps(x4[k]), b, c4); c5 = _mm512_fmadd_ps(_mm512_set1_ps(x5[k]), b, c5);
+        }
+        c0 = _mm512_add_ps(c0, d0); c1 = _mm512_add_ps(c1, d1); c2 = _mm512_add_ps(c2, d2);
+        c3 = _mm512_add_ps(c3, d3); c4 = _mm512_add_ps(c4, d4); c5 = _mm512_add_ps(c5, d5);
+        float t[QI_MR][QI_NR];
+        _mm512_storeu_ps(t[0], c0); _mm512_storeu_ps(t[1], c1); _mm512_storeu_ps(t[2], c2);
+        _mm512_storeu_ps(t[3], c3); _mm512_storeu_ps(t[4], c4); _mm512_storeu_ps(t[5], c5);
+        for (int i = 0; i < QI_MR; i++)
+            for (int j = 0; j < nr; j++)
+                Y[(int64_t)i*ldy + j] = accumulate ? Y[(int64_t)i*ldy + j] + t[i][j] : t[i][j];
+        return;
+    }
+#endif
 #if defined(__AVX2__) && defined(__FMA__)
     if (mr == QI_MR) {
         __m256 c00=_mm256_setzero_ps(), c01=_mm256_setzero_ps(), c10=_mm256_setzero_ps(), c11=_mm256_setzero_ps();
