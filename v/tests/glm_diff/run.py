@@ -25,10 +25,11 @@ for k in range(N):
                shards=R.choice([1, 2]))
     d = os.path.join(w, 'm%03d' % k); gm.make(d, k + 1, **cfg); cap = R.choice([1, 3, 16])
     ce = dict(env, SNAP=d, REF=d + '/ref.json', DUMP=d + '/c.dump')
-    c = subprocess.run([w + '/colibri', str(cap), '16', '16'], capture_output=True, text=True, env=ce)
+    bits = int(os.environ['GLM_BITS']) if os.environ.get('GLM_BITS') else R.choice([16, 16, 8]); ce['IDOT'] = '0'                       # int8 runs use the engine's float-activation kernels (IDOT=0)
+    c = subprocess.run([w + '/colibri', str(cap), str(bits), str(bits)], capture_output=True, text=True, env=ce)
     ctoks = [l for l in c.stdout.split('\n') if l.startswith('GLM C engine')]
     ctoks = ctoks[0].split(':', 1)[1].split() if ctoks else None
-    v = subprocess.run([w + '/glm_v', d, str(cap), d + '/ref.json', d + '/v.dump'], capture_output=True, text=True, env=env)
+    v = subprocess.run([w + '/glm_v', d, str(cap), d + '/ref.json', d + '/v.dump', str(bits)], capture_output=True, text=True, env=env)
     if c.returncode or v.returncode or ctoks is None:
         print('RUN FAILED', d, c.returncode, c.stdout[-300:], c.stderr[-300:], '|', v.returncode, v.stderr[-300:]); bad += 1; continue
     vt = v.stdout.split('\n')[0].split()
@@ -37,7 +38,7 @@ for k in range(N):
     if os.environ.get('GLM_WHY'): print('exact' if same else 'inexact', {k: v for k, v in cfg.items() if k in ('H','L','first_dense','K','nope','rope','vh','kvl','ql','bf','shared','prompt_len','n_new','di','mi','D')})
     ok = vt == ctoks and a.shape == b.shape and np.allclose(a, b, rtol=1e-4, atol=1e-4 * max(1.0, float(np.abs(a).max())))
     if not ok or (EXACT and not same):
-        bad += 1; print('DIFFERENT', d, cfg, '\n  C', ctoks, '\n  V', vt, '\n  shapes', a.shape, b.shape, 'max abs', float(np.abs(a - b).max()) if a.shape == b.shape else None)
+        bad += 1; print('DIFFERENT', d, 'bits', bits, cfg, '\n  C', ctoks, '\n  V', vt, '\n  shapes', a.shape, b.shape, 'max abs', float(np.abs(a - b).max()) if a.shape == b.shape else None)
         if bad >= 3: break
 if bad: print('glm differential: DIFFERENT, kept in', w); sys.exit(1)
 print('glm differential: %d checkpoints, generated ids identical, all logits within 1e-4; bit-identical in %d of %d' % (total, exact, total))

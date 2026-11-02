@@ -16,6 +16,7 @@ import os
 import cjson
 import safetensors
 import kernels
+import math
 
 #include <math.h>
 
@@ -102,31 +103,78 @@ pub fn load_cfg(dir string) !Cfg {
 	return c
 }
 
+// a weight matrix [o, i]: f32, or int8 with one f32 scale per row (the engine's `bits` 5..8, quantized at load as quantize_rows does)
+struct W {
+	f []f32
+	q []i8
+	s []f32
+	o int
+	i int
+}
+
+fn C.lrintf(x f32) i64
+
+fn quantize_rows(w []f32, o int, i int, bits int) W {
+	qmax := (1 << (bits - 1)) - 1
+	mut q := []i8{len: o * i}
+	mut sc := []f32{len: o}
+	for r in 0 .. o {
+		mut amax := f32(0)
+		for k in 0 .. i {
+			a := f32(math.abs(w[r * i + k]))
+			if a > amax {
+				amax = a
+			}
+		}
+		mut s := amax / f32(qmax)
+		if s < f32(1e-8) {
+			s = f32(1e-8)
+		}
+		sc[r] = s
+		for k in 0 .. i {
+			mut v := int(C.lrintf(w[r * i + k] / s))
+			if v > qmax {
+				v = qmax
+			}
+			if v < -qmax - 1 {
+				v = -qmax - 1
+			}
+			q[r * i + k] = i8(v)
+		}
+	}
+	return W{
+		q: q
+		s: sc
+		o: o
+		i: i
+	}
+}
+
 struct Layer {
 	in_ln   []f32
 	post_ln []f32
-	q_a     []f32
+	q_a     W
 	q_a_ln  []f32
-	q_b     []f32
-	kv_a    []f32
+	q_b     W
+	kv_a    W
 	kv_a_ln []f32
-	kv_b    []f32
-	o       []f32
+	kv_b    W
+	o       W
 	sparse  bool
-	gate    []f32 // dense MLP
-	up      []f32
-	down    []f32
+	gate    W // dense MLP
+	up      W
+	down    W
 	router  []f32 // sparse
 	bias    []f32
-	sh_gate []f32
-	sh_up   []f32
-	sh_down []f32
+	sh_gate W
+	sh_up   W
+	sh_down W
 }
 
 struct Expert {
-	g []f32
-	u []f32
-	d []f32
+	g W
+	u W
+	d W
 mut:
 	used u64
 }
@@ -147,6 +195,7 @@ pub mut:
 	lat        [][]f32 // [layer][t][kv_lora]: the normed KV latent
 	rop        [][]f32 // [layer][t][qk_rope]: the roped shared key
 	max_t      int
+	bits       int
 	cache      []map[int]&Expert
 	clock      u64
 	blk        int  // block width of the engine's scalar dot loops: 8 (AVX-512), 4 (AVX2), 0
@@ -162,6 +211,15 @@ fn (m &Model) load(name string, want i64) ![]f32 {
 }
 
 pub fn open(dir string, cap int) !Model {
+	return open_bits(dir, cap, 16)
+}
+
+// open_bits: bits >= 16 keeps f32 weights, 5..8 quantizes the layer matrices and the experts to int8 per row at load (the engine's
+// `colibri CAP 8 8`; the embedding and lm_head stay f32 as the engine keeps them above 8 dense bits)
+pub fn open_bits(dir string, cap int, bits int) !Model {
+	if bits < 5 {
+		return error('only f32 (16) and int8 (5..8) weights are supported')
+	}
 	c := load_cfg(dir)!
 	mut m := Model{
 		c:         c
@@ -174,6 +232,7 @@ pub fn open(dir string, cap int) !Model {
 			0
 		}
 		cache_cap: if cap < 1 { 1 } else { cap }
+		bits:      bits
 		store:     safetensors.open(dir)!
 	}
 	d := i64(c.hidden)
@@ -188,13 +247,13 @@ pub fn open(dir string, cap int) !Model {
 		mut l := Layer{
 			in_ln:   m.load(p + 'input_layernorm.weight', d)!
 			post_ln: m.load(p + 'post_attention_layernorm.weight', d)!
-			q_a:     m.load(p + 'self_attn.q_a_proj.weight', i64(c.q_lora) * d)!
+			q_a:     m.load_w(p + 'self_attn.q_a_proj.weight', c.q_lora, int(d))!
 			q_a_ln:  m.load(p + 'self_attn.q_a_layernorm.weight', c.q_lora)!
-			q_b:     m.load(p + 'self_attn.q_b_proj.weight', h * c.qk_head * c.q_lora)!
-			kv_a:    m.load(p + 'self_attn.kv_a_proj_with_mqa.weight', i64(c.kv_lora + c.qk_rope) * d)!
+			q_b:     m.load_w(p + 'self_attn.q_b_proj.weight', int(h) * c.qk_head, c.q_lora)!
+			kv_a:    m.load_w(p + 'self_attn.kv_a_proj_with_mqa.weight', c.kv_lora + c.qk_rope, int(d))!
 			kv_a_ln: m.load(p + 'self_attn.kv_a_layernorm.weight', c.kv_lora)!
-			kv_b:    m.load(p + 'self_attn.kv_b_proj.weight', h * (c.qk_nope + c.v_head) * c.kv_lora)!
-			o:       m.load(p + 'self_attn.o_proj.weight', d * h * c.v_head)!
+			kv_b:    m.load_w(p + 'self_attn.kv_b_proj.weight', int(h) * (c.qk_nope + c.v_head), c.kv_lora)!
+			o:       m.load_w(p + 'self_attn.o_proj.weight', int(d), int(h) * c.v_head)!
 			sparse:  sparse
 		}
 		if sparse {
@@ -202,22 +261,42 @@ pub fn open(dir string, cap int) !Model {
 				...l
 				router:  m.load(p + 'mlp.gate.weight', i64(c.n_experts) * d)!
 				bias:    m.load(p + 'mlp.gate.e_score_correction_bias', c.n_experts)!
-				sh_gate: m.load(p + 'mlp.shared_experts.gate_proj.weight', si * d)!
-				sh_up:   m.load(p + 'mlp.shared_experts.up_proj.weight', si * d)!
-				sh_down: m.load(p + 'mlp.shared_experts.down_proj.weight', d * si)!
+				sh_gate: m.load_w(p + 'mlp.shared_experts.gate_proj.weight', int(si), int(d))!
+				sh_up:   m.load_w(p + 'mlp.shared_experts.up_proj.weight', int(si), int(d))!
+				sh_down: m.load_w(p + 'mlp.shared_experts.down_proj.weight', int(d), int(si))!
 			}
 		} else {
 			l = Layer{
 				...l
-				gate: m.load(p + 'mlp.gate_proj.weight', i64(c.dense_inter) * d)!
-				up:   m.load(p + 'mlp.up_proj.weight', i64(c.dense_inter) * d)!
-				down: m.load(p + 'mlp.down_proj.weight', d * c.dense_inter)!
+				gate: m.load_w(p + 'mlp.gate_proj.weight', c.dense_inter, int(d))!
+				up:   m.load_w(p + 'mlp.up_proj.weight', c.dense_inter, int(d))!
+				down: m.load_w(p + 'mlp.down_proj.weight', int(d), c.dense_inter)!
 			}
 		}
 		m.layers << l
 		m.cache << map[int]&Expert{}
 	}
 	return m
+}
+
+fn (m &Model) load_w(name string, o int, i int) !W {
+	f := m.load(name, i64(o) * i)!
+	if m.bits >= 16 {
+		return W{
+			f: f
+			o: o
+			i: i
+		}
+	}
+	return quantize_rows(f, o, i, m.bits)
+}
+
+// mm: y[S,O] = x[S,I] . W^T
+fn (m &Model) mm(x []f32, s_n int, w &W) ![]f32 {
+	if w.q.len > 0 {
+		return kernels.matmul_q(x, w.q, w.s, s_n, w.i, w.o)
+	}
+	return kernels.matmul_f32(x, w.f, s_n, w.i, w.o)
 }
 
 pub fn (mut m Model) close() {
@@ -339,19 +418,18 @@ fn hybrid_dot(q []f32, qoff int, k []f32, koff int, n int, init f32, w int) f32 
 fn (mut m Model) attention(li int, x []f32, s_n int, pos_base int) ![]f32 {
 	c := &m.c
 	l := &m.layers[li]
-	d := c.hidden
 	h_n := c.n_heads
 	nope := c.qk_nope
 	rr := c.qk_rope
 	qh := c.qk_head
 	vh := c.v_head
 	kvl := c.kv_lora
-	mut qr := kernels.matmul_f32(x, l.q_a, s_n, d, c.q_lora)!
+	mut qr := m.mm(x, s_n, &l.q_a)!
 	for s in 0 .. s_n {
 		rmsnorm(mut qr, s * c.q_lora, qr.clone(), s * c.q_lora, l.q_a_ln, c.q_lora, c.eps)
 	}
-	mut q := kernels.matmul_f32(qr, l.q_b, s_n, c.q_lora, h_n * qh)!
-	comp := kernels.matmul_f32(x, l.kv_a, s_n, d, kvl + rr)!
+	mut q := m.mm(qr, s_n, &l.q_b)!
+	comp := m.mm(x, s_n, &l.kv_a)!
 	for s in 0 .. s_n {
 		pos := pos_base + s
 		for h in 0 .. h_n {
@@ -379,7 +457,7 @@ fn (mut m Model) attention(li int, x []f32, s_n int, pos_base int) ![]f32 {
 		// with one matmul over the latent cache (kv_b), then scores and mixes in that space
 		tk := pos_base + s_n
 		kvb_dim := h_n * (nope + vh)
-		kvb := kernels.matmul_f32(unsafe { m.lat[li][..tk * kvl] }, l.kv_b, tk, kvl, kvb_dim)!
+		kvb := m.mm(unsafe { m.lat[li][..tk * kvl] }, tk, &l.kv_b)!
 		for s in 0 .. s_n {
 			pos := pos_base + s
 			nt := pos + 1
@@ -400,7 +478,7 @@ fn (mut m Model) attention(li int, x []f32, s_n int, pos_base int) ![]f32 {
 				}
 			}
 		}
-		return kernels.matmul_f32(ctx, l.o, s_n, h_n * vh, d)
+		return m.mm(ctx, s_n, &l.o)
 	}
 	for s in 0 .. s_n {
 		pos := pos_base + s
@@ -411,8 +489,16 @@ fn (mut m Model) attention(li int, x []f32, s_n int, pos_base int) ![]f32 {
 			mut qabs := []f32{len: kvl}
 			for dd in 0 .. nope { // the query through kv_b's key rows
 				coef := q[qp + dd]
-				for i in 0 .. kvl {
-					qabs[i] += coef * l.kv_b[(rbase + dd) * kvl + i]
+				row := rbase + dd
+				if l.kv_b.q.len > 0 { // int8 row: the scale joins the coefficient, then one product per element
+					cs := coef * l.kv_b.s[row]
+					for i in 0 .. kvl {
+						qabs[i] += cs * f32(l.kv_b.q[row * kvl + i])
+					}
+				} else {
+					for i in 0 .. kvl {
+						qabs[i] += coef * l.kv_b.f[row * kvl + i]
+					}
 				}
 			}
 			for jj in 0 .. nt {
@@ -427,26 +513,35 @@ fn (mut m Model) attention(li int, x []f32, s_n int, pos_base int) ![]f32 {
 					clat[i] += sc[jj] * m.lat[li][jj * kvl + i]
 				}
 			}
-			for r in 0 .. vh { // the value rows of kv_b, in double as qt_matvec_rows does
-				mut a := f64(0)
-				for i in 0 .. kvl {
-					a += f64(l.kv_b[(rbase + nope + r) * kvl + i]) * f64(clat[i])
+			for r in 0 .. vh { // the value rows of kv_b, as qt_matvec_rows computes them
+				row := rbase + nope + r
+				if l.kv_b.q.len > 0 { // int8: a float dot of the converted row, then the row scale
+					mut wf := []f32{len: kvl}
+					for i in 0 .. kvl {
+						wf[i] = f32(l.kv_b.q[row * kvl + i])
+					}
+					ctx[(s * h_n + h) * vh + r] = hybrid_dot(wf, 0, clat, 0, kvl, 0, m.blk) * l.kv_b.s[row]
+				} else {
+					mut a := f64(0)
+					for i in 0 .. kvl {
+						a += f64(l.kv_b.f[row * kvl + i]) * f64(clat[i])
+					}
+					ctx[(s * h_n + h) * vh + r] = f32(a)
 				}
-				ctx[(s * h_n + h) * vh + r] = f32(a)
 			}
 		}
 	}
-	return kernels.matmul_f32(ctx, l.o, s_n, h_n * vh, d)
+	return m.mm(ctx, s_n, &l.o)
 }
 
 // swiglu: down(silu(gate x) * up x) for S rows
-fn swiglu(x []f32, s_n int, g []f32, u []f32, dn []f32, d int, inter int) ![]f32 {
-	mut gg := kernels.matmul_f32(x, g, s_n, d, inter)!
-	uu := kernels.matmul_f32(x, u, s_n, d, inter)!
-	for i in 0 .. s_n * inter {
+fn (m &Model) swiglu(x []f32, s_n int, g &W, u &W, dn &W) ![]f32 {
+	mut gg := m.mm(x, s_n, g)!
+	uu := m.mm(x, s_n, u)!
+	for i in 0 .. s_n * g.o {
 		gg[i] = siluf(gg[i]) * uu[i]
 	}
-	return kernels.matmul_f32(gg, dn, s_n, inter, d)
+	return m.mm(gg, s_n, dn)
 }
 
 fn (mut m Model) expert(layer int, eid int) !&Expert {
@@ -459,11 +554,10 @@ fn (mut m Model) expert(layer int, eid int) !&Expert {
 	m.miss++
 	c := &m.c
 	p := 'model.layers.${layer}.mlp.experts.${eid}.'
-	n := i64(c.moe_inter) * c.hidden
 	e := &Expert{
-		g:    m.load(p + 'gate_proj.weight', n)!
-		u:    m.load(p + 'up_proj.weight', n)!
-		d:    m.load(p + 'down_proj.weight', n)!
+		g:    m.load_w(p + 'gate_proj.weight', c.moe_inter, c.hidden)!
+		u:    m.load_w(p + 'up_proj.weight', c.moe_inter, c.hidden)!
+		d:    m.load_w(p + 'down_proj.weight', c.hidden, c.moe_inter)!
 		used: m.clock
 	}
 	if m.cache[layer].len >= m.cache_cap {
@@ -550,7 +644,7 @@ fn (mut m Model) moe(li int, x []f32, s_n int) ![]f32 {
 		for s in 0 .. s_n {
 			for kk in 0 .. c.topk {
 				if all_idx[s][kk] == e {
-					hh := swiglu(unsafe { x[s * d..(s + 1) * d] }, 1, ex.g, ex.u, ex.d, d, c.moe_inter)!
+					hh := m.swiglu(unsafe { x[s * d..(s + 1) * d] }, 1, &ex.g, &ex.u, &ex.d)!
 					for j in 0 .. d {
 						out[s * d + j] += all_w[s][kk] * hh[j]
 					}
@@ -558,8 +652,7 @@ fn (mut m Model) moe(li int, x []f32, s_n int) ![]f32 {
 			}
 		}
 	}
-	si := c.moe_inter * c.n_shared
-	sh := swiglu(x, s_n, l.sh_gate, l.sh_up, l.sh_down, d, si)!
+	sh := m.swiglu(x, s_n, &l.sh_gate, &l.sh_up, &l.sh_down)!
 	for j in 0 .. s_n * d {
 		out[j] += sh[j]
 	}
@@ -596,7 +689,7 @@ fn (mut m Model) step(ids []int, pos_base int) ![]f32 {
 		tmp2 := if l.sparse {
 			m.moe(li, nrm, s_n)!
 		} else {
-			swiglu(nrm, s_n, l.gate, l.up, l.down, d, c.dense_inter)!
+			m.swiglu(nrm, s_n, &l.gate, &l.up, &l.down)!
 		}
 		for j in 0 .. s_n * d {
 			x[j] += tmp2[j]

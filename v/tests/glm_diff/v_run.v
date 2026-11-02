@@ -18,7 +18,8 @@ fn main() {
 	ref := cjson.parse(os.read_file(os.args[3]) or { panic(err) })
 	prompt := ids(&ref, 'prompt_ids')
 	full := ids(&ref, 'full_ids')
-	mut m := glm.open(dir, cap) or {
+	bits := if os.args.len > 5 { os.args[5].int() } else { 16 }
+	mut m := glm.open_bits(dir, cap, bits) or {
 		eprintln('${err}')
 		exit(1)
 	}
