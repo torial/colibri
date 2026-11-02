@@ -282,6 +282,9 @@ pub fn open_bits(dir string, cap int, bits int) !Model {
 }
 
 fn (m &Model) load_w(name string, o int, i int) !W {
+	if m.store.has(name + '.qs') {
+		return m.load_container(name, o, i)!
+	}
 	f := m.load(name, i64(o) * i)!
 	if m.bits >= 16 {
 		return W{
@@ -311,6 +314,29 @@ fn (m &Model) mmx(x []f32, s_n int, w &W, allow_idot bool) ![]f32 {
 		return kernels.matmul_q(x, w.q, w.s, s_n, w.i, w.o)
 	}
 	return kernels.matmul_f32(x, w.f, s_n, w.i, w.o)
+}
+
+// load_container reads a converted matrix: int8 rows (O*I bytes) and one f32 scale per row in <name>.qs, used as they are whatever
+// `bits` says, as the engine does. The engine's other container formats (int4 packed, grouped, int3, E8, fp8 blocks) are told
+// apart by byte counts and stamps; they are not ported and are refused by name.
+fn (m &Model) load_container(name string, o int, i int) !W {
+	t := m.store.find(name) or { return error('missing ${name}') }
+	ts := m.store.find(name + '.qs') or { return error('missing ${name}.qs') }
+	if t.nbytes != i64(o) * i || ts.numel != o {
+		return error('${name}: a ${t.nbytes}-byte weight with ${ts.numel} scales is not an int8 [${o}, ${i}] container (int4, grouped and other container formats are not supported by the V engine yet), refusing')
+	}
+	raw := m.store.read_raw(name)!
+	sc := m.store.read_f32_cap(name + '.qs', o, false)!
+	mut q := []i8{len: raw.len}
+	for k in 0 .. raw.len {
+		q[k] = i8(raw[k])
+	}
+	return W{
+		q: q
+		s: sc
+		o: o
+		i: i
+	}
 }
 
 pub fn (mut m Model) close() {

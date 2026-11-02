@@ -22,7 +22,7 @@ for k in range(N):
     cfg = dict(D=R.choice([16, 32]), H=H, L=L, first_dense=R.choice([0, 1]), E=E, K=R.randint(1, min(E, 3)), mi=R.choice([8, 16]), di=R.choice([8, 24]),
                ql=R.choice([8, 16]), kvl=R.choice([8, 16]), nope=nope, rope=rope, vh=vh, shared=R.choice([1, 2]), V=R.choice([24, 48]), bf=R.random() < .4,
                norm_topk=R.random() < .6, routed_scale=R.choice([1.0, 1.5, 2.5]), theta=R.choice([10000.0, 1000.0]), prompt_len=R.choice([1, 3, 6]), n_new=R.choice([2, 5]),
-               shards=R.choice([1, 2]))
+               shards=R.choice([1, 2]), qs8=R.random() < .3)
     d = os.path.join(w, 'm%03d' % k); gm.make(d, k + 1, **cfg); cap = R.choice([1, 3, 16])
     ce = dict(env, SNAP=d, REF=d + '/ref.json', DUMP=d + '/c.dump')
     bits = int(os.environ['GLM_BITS']) if os.environ.get('GLM_BITS') else R.choice([16, 16, 8]); idot = R.random() < .6
@@ -39,7 +39,7 @@ for k in range(N):
     if os.environ.get('GLM_WHY'): print('exact' if same else 'inexact', {k: v for k, v in cfg.items() if k in ('H','L','first_dense','K','nope','rope','vh','kvl','ql','bf','shared','prompt_len','n_new','di','mi','D')})
     ok = vt == ctoks and a.shape == b.shape and np.allclose(a, b, rtol=1e-4, atol=1e-4 * max(1.0, float(np.abs(a).max())))
     if not ok or (EXACT and not same):
-        bad += 1; print('DIFFERENT', d, 'bits', bits, 'idot', idot, cfg, '\n  C', ctoks, '\n  V', vt, '\n  shapes', a.shape, b.shape, 'max abs', float(np.abs(a - b).max()) if a.shape == b.shape else None)
+        bad += 1; print('DIFFERENT', d, 'bits', bits, 'qs8', cfg.get('qs8'), 'idot', idot, cfg, '\n  C', ctoks, '\n  V', vt, '\n  shapes', a.shape, b.shape, 'max abs', float(np.abs(a - b).max()) if a.shape == b.shape else None)
         if bad >= 3: break
 if bad: print('glm differential: DIFFERENT, kept in', w); sys.exit(1)
 print('glm differential: %d checkpoints, generated ids identical, all logits within 1e-4; bit-identical in %d of %d' % (total, exact, total))

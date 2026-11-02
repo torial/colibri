@@ -1,6 +1,7 @@
 module glm
 
 import os
+import safetensors
 
 fn tmp_cfg(text string) string {
 	d := os.join_path(os.vtmp_dir(), 'glm_cfg_${os.getpid()}')
@@ -41,4 +42,29 @@ fn test_the_score_dot_has_its_lane_structure() {
 	l := []f32{len: 11, init: 1}
 	// all small integers: exact in any order, so both forms agree on the value
 	assert lat_dot(q, l, 0, 11, true, 4) == 66 && lat_dot(q, l, 0, 11, false, 0) == 66
+}
+
+fn test_container_formats_it_cannot_read_are_refused() {
+	// an int4-packed weight (half the bytes) beside a scale per row is a container format this engine does not read yet
+	d := os.join_path(os.vtmp_dir(), 'glm_qs_${os.getpid()}')
+	os.mkdir_all(d) or { panic(err) }
+	mut blob := []u8{}
+	hdr := '{"w":{"dtype":"U8","shape":[2,2],"data_offsets":[0,4]},"w.qs":{"dtype":"F32","shape":[2],"data_offsets":[4,12]}}'
+	n := u64(hdr.len)
+	for i in 0 .. 8 {
+		blob << u8(n >> (8 * u64(i)))
+	}
+	blob << hdr.bytes()
+	blob << []u8{len: 12}
+	os.write_file_array('${d}/m.safetensors', blob) or { panic(err) }
+	mut m := Model{
+		store: safetensors.open(d)!
+	}
+	if _ := m.load_container('w', 2, 4) { // O=2, I=4 would need 8 bytes: this is 4, packed int4
+		assert false
+	} else {
+		assert err.msg().contains('not an int8')
+	}
+	assert (m.load_container('w', 2, 2) or { panic(err) }).q.len == 4
+	m.close()
 }
