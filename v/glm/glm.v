@@ -105,11 +105,12 @@ pub fn load_cfg(dir string) !Cfg {
 
 // a weight matrix [o, i]: f32, or int8 with one f32 scale per row (the engine's `bits` 5..8, quantized at load as quantize_rows does)
 struct W {
-	f []f32
-	q []i8
-	s []f32
-	o int
-	i int
+	f  []f32
+	q  []i8
+	q4 []u8 // int4 packed rows (a converted container): two per byte, low nibble first, value = nibble - 8
+	s  []f32
+	o  int
+	i  int
 }
 
 fn C.lrintf(x f32) i64
@@ -307,6 +308,12 @@ fn (m &Model) mm(x []f32, s_n int, w &W) ![]f32 {
 }
 
 fn (m &Model) mmx(x []f32, s_n int, w &W, allow_idot bool) ![]f32 {
+	if w.q4.len > 0 {
+		if m.idot && allow_idot {
+			return kernels.matmul_i4_idot(x, w.q4, w.s, s_n, w.i, w.o)
+		}
+		return kernels.matmul_i4(x, w.q4, w.s, s_n, w.i, w.o)
+	}
 	if w.q.len > 0 {
 		if m.idot && allow_idot {
 			return kernels.matmul_q_idot(x, w.q, w.s, s_n, w.i, w.o)
@@ -322,8 +329,21 @@ fn (m &Model) mmx(x []f32, s_n int, w &W, allow_idot bool) ![]f32 {
 fn (m &Model) load_container(name string, o int, i int) !W {
 	t := m.store.find(name) or { return error('missing ${name}') }
 	ts := m.store.find(name + '.qs') or { return error('missing ${name}.qs') }
+	if ts.numel == o && t.nbytes == i64(o) * ((i + 1) / 2) && t.nbytes != i64(o) * i {
+		// int4 packed rows with a scale per row: the engine's fmt 2. The V engine reads it for the matrices the integer or the plain
+		// float int4 kernels serve; kv_b is read row by row by the absorbed attention, which is not ported for int4 yet
+		if name.ends_with('kv_b_proj.weight') {
+			return error('${name}: an int4 kv_b container is not supported by the V engine yet (the absorbed attention reads its rows), refusing')
+		}
+		return W{
+			q4: m.store.read_raw(name)!
+			s:  m.store.read_f32_cap(name + '.qs', o, false)!
+			o:  o
+			i:  i
+		}
+	}
 	if t.nbytes != i64(o) * i || ts.numel != o {
-		return error('${name}: a ${t.nbytes}-byte weight with ${ts.numel} scales is not an int8 [${o}, ${i}] container (int4, grouped and other container formats are not supported by the V engine yet), refusing')
+		return error('${name}: a ${t.nbytes}-byte weight with ${ts.numel} scales is not an int8 or int4-packed [${o}, ${i}] container (grouped and other container formats are not supported by the V engine yet), refusing')
 	}
 	raw := m.store.read_raw(name)!
 	sc := m.store.read_f32_cap(name + '.qs', o, false)!
@@ -576,8 +596,15 @@ fn (mut m Model) attention(li int, x []f32, s_n int, pos_base int) ![]f32 {
 
 // swiglu: down(silu(gate x) * up x) for S rows
 fn (m &Model) swiglu(x []f32, s_n int, g &W, u &W, dn &W) ![]f32 {
-	mut gg := m.mm(x, s_n, g)!
-	uu := m.mm(x, s_n, u)!
+	return m.swiglu_x(x, s_n, g, u, dn, false)
+}
+
+// swiglu_x: routed experts on a single row take the engine's fused float pair kernel for gate and up when both are int4
+// (expert_gate_up), not the integer path
+fn (m &Model) swiglu_x(x []f32, s_n int, g &W, u &W, dn &W, expert bool) ![]f32 {
+	pair := expert && s_n == 1 && g.q4.len > 0 && u.q4.len > 0
+	mut gg := if pair { kernels.matmul_i4(x, g.q4, g.s, 1, g.i, g.o)! } else { m.mm(x, s_n, g)! }
+	uu := if pair { kernels.matmul_i4(x, u.q4, u.s, 1, u.i, u.o)! } else { m.mm(x, s_n, u)! }
 	for i in 0 .. s_n * g.o {
 		gg[i] = siluf(gg[i]) * uu[i]
 	}
@@ -681,10 +708,18 @@ fn (mut m Model) moe(li int, x []f32, s_n int) ![]f32 {
 	}
 	for e in uniq {
 		ex := m.expert(li, e)!
+		mut rows := 0 // how many rows of this batch routed e: a lone row takes the fused float pair kernel for gate and up
 		for s in 0 .. s_n {
 			for kk in 0 .. c.topk {
 				if all_idx[s][kk] == e {
-					hh := m.swiglu(unsafe { x[s * d..(s + 1) * d] }, 1, &ex.g, &ex.u, &ex.d)!
+					rows++
+				}
+			}
+		}
+		for s in 0 .. s_n {
+			for kk in 0 .. c.topk {
+				if all_idx[s][kk] == e {
+					hh := m.swiglu_x(unsafe { x[s * d..(s + 1) * d] }, 1, &ex.g, &ex.u, &ex.d, rows == 1)!
 					for j in 0 .. d {
 						out[s * d + j] += all_w[s][kk] * hh[j]
 					}

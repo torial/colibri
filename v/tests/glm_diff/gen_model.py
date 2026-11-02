@@ -15,7 +15,7 @@ def bf16(a):
     u = np.asarray(a, dtype=np.float32).view(np.uint32); return ((u + 0x7fff + ((u >> 16) & 1)) >> 16).astype(np.uint16).tobytes()
 
 def make(d, seed=1, D=32, H=4, L=3, first_dense=1, E=8, K=2, mi=16, di=24, ql=16, kvl=16, nope=8, rope=8, vh=8, shared=1, V=48,
-         bf=False, norm_topk=True, routed_scale=1.5, theta=10000.0, eps=1e-5, prompt_len=5, n_new=5, shards=1, qs8=False):
+         bf=False, norm_topk=True, routed_scale=1.5, theta=10000.0, eps=1e-5, prompt_len=5, n_new=5, shards=1, qs8=False, qs4=False):
     rs = np.random.RandomState(seed); os.makedirs(d, exist_ok=True); qk = nope + rope
     cfg = {'model_type': 'glm_moe_dsa', 'hidden_size': D, 'num_hidden_layers': L, 'num_attention_heads': H, 'n_routed_experts': E,
            'num_experts_per_tok': K, 'moe_intermediate_size': mi, 'intermediate_size': di, 'first_k_dense_replace': first_dense,
@@ -28,8 +28,15 @@ def make(d, seed=1, D=32, H=4, L=3, first_dense=1, E=8, K=2, mi=16, di=24, ql=16
     def w(name, shape, scale=0.2, center=0.0, f32=False):
         a = (rs.randn(*shape) * scale + center).astype(np.float32)
         T[name] = ('F32', list(shape), a.tobytes()) if (f32 or not bf) else ('BF16', list(shape), bf16(a))
-    def wq(name, shape, scale=0.3):   # a converted container's matrix: int8 rows plus one f32 scale per row in <name>.qs
-        if not qs8:
+    def wq(name, shape, scale=0.3):   # a converted container's matrix: int8 (or packed int4) rows plus one f32 scale per row in <name>.qs
+        if qs4 and 'kv_b' not in name:
+            O, I = shape; rb = (I + 1) // 2
+            nib = rs.randint(0, 16, size=(O, rb * 2)).astype(np.uint8)
+            if I % 2: nib[:, -1] = 8                      # the odd tail nibble is a zero weight
+            T[name] = ('U8', [O, rb], (nib[:, 0::2] | (nib[:, 1::2] << 4)).astype(np.uint8).tobytes())
+            T[name + '.qs'] = ('F32', [O], (rs.rand(O) * 0.04 + 0.01).astype(np.float32).tobytes())
+            return
+        if not (qs8 or qs4):
             return w(name, shape, scale)
         T[name] = ('I8', list(shape), rs.randint(-127, 128, size=shape).astype(np.int8).tobytes())
         T[name + '.qs'] = ('F32', [shape[0]], (rs.rand(shape[0]) * 0.02 + 0.004).astype(np.float32).tobytes())

@@ -60,11 +60,12 @@ fn test_container_formats_it_cannot_read_are_refused() {
 	mut m := Model{
 		store: safetensors.open(d)!
 	}
-	if _ := m.load_container('w', 2, 4) { // O=2, I=4 would need 8 bytes: this is 4, packed int4
+	if _ := m.load_container('w', 2, 8) { // 4 bytes for a [2, 8] matrix is neither int8 (16) nor packed int4 (8)
 		assert false
 	} else {
-		assert err.msg().contains('not an int8')
+		assert err.msg().contains('not an int8 or int4')
 	}
-	assert (m.load_container('w', 2, 2) or { panic(err) }).q.len == 4
+	assert (m.load_container('w', 2, 2) or { panic(err) }).q.len == 4 // int8
+	assert (m.load_container('w', 2, 4) or { panic(err) }).q4.len == 4 // packed int4
 	m.close()
 }

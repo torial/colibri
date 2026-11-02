@@ -21,6 +21,7 @@ fn C.coli_k_matmul_f32(y &f32, x &f32, w &f32, s int, i int, o int)
 fn C.coli_k_dot_f32(x &f32, w &f32, i int) f32
 fn C.coli_k_olm_matmul_q(y &f32, x &f32, q &u8, scale &f32, i int, o int)
 fn C.coli_k_matmul_q_idot(y &f32, x &f32, q &i8, scale &f32, s int, i int, o int)
+fn C.coli_k_matmul_i4_idot(y &f32, x &f32, q4 &u8, scale &f32, s int, i int, o int)
 fn C.coli_k_matmul_q(y &f32, x &f32, q &i8, scale &f32, s int, i int, o int)
 fn C.coli_k_matmul_i4(y &f32, x &f32, q4 &u8, scale &f32, s int, i int, o int)
 fn C.coli_k_matmul_i4_grouped(y &f32, x &f32, q4 &u8, scale &f32, s int, i int, o int, gs int)
@@ -134,6 +135,19 @@ pub fn matmul_i4(x []f32, q4 []u8, scale []f32, s int, i int, o int) ![]f32 {
 	mut y := []f32{len: s * o}
 	if s > 0 {
 		C.coli_k_matmul_i4(y.data, x.data, q4.data, scale.data, s, i, o)
+	}
+	return y
+}
+
+// matmul_i4_idot: int4 weights with the activations quantized to int8 per row, exact integer dots (the engines' default for int4)
+pub fn matmul_i4_idot(x []f32, q4 []u8, scale []f32, s int, i int, o int) ![]f32 {
+	shape(s, i, o)!
+	need('x', x.len, i64(s) * i)!
+	need('q4', q4.len, i64(o) * ((i + 1) / 2))!
+	need('scale', scale.len, o)!
+	mut y := []f32{len: s * o}
+	if s > 0 {
+		C.coli_k_matmul_i4_idot(y.data, x.data, q4.data, scale.data, s, i, o)
 	}
 	return y
 }
