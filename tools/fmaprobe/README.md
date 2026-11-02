@@ -32,7 +32,7 @@ The loop that started this, `a += x[d] * y[d]` over `d < n` with `n` known only 
 So the same source statement is fused for some lengths and not for others. A port that writes the loop the obvious way, or with
 an explicit `fma` everywhere, matches the C only for the lengths where the compiler happened to agree. Writing the same
 block-and-remainder structure (`hybrid_dot` in `v/glm/glm.v`) made the V port bit-identical to the C engine for the rotary-key
-dot product at every length tried.
+dot product at every length tried. With the engine's prompt path (more than four rows are not absorbed) written the same way, the whole GLM port matched the C engine on every generated checkpoint, bit for bit.
 
 ## Limits
 

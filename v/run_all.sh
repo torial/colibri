@@ -19,5 +19,5 @@ cmp -s "$w/cu.txt" "$w/vu.txt" && echo "unicode classes: every code point identi
 python3 tests/sample_diff/run.py $((300 * k)) 1
 python3 tests/kern_diff/run.py $((40 * k)) 1
 python3 tests/olmoe_diff/run.py $((12 * k)) 1
-python3 tests/glm_diff/run.py $((10 * k)) 1
+python3 tests/glm_diff/run.py $((10 * k)) 1 --exact
 rm -rf "$w"

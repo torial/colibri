@@ -3,7 +3,7 @@
 expert and dense bits = f32 weights): tiny glm_moe_dsa checkpoints (MLA attention, sigmoid router with selection bias, shared
 expert, leading dense layers; F32 and BF16; sharded) are run by the C engine (DUMP=<path> writes every forward's logits) and
 by v/glm. The generated ids must be identical and the logits must agree; the report says how many are bit-identical.
-usage: run.py [cases, default 10] [seed] [--exact]   (--exact: fail unless every logit is bit-identical when kv_lora + qk_rope is a multiple of 4, the shape of every real GLM)"""
+usage: run.py [cases, default 10] [seed] [--exact]   (--exact: fail unless every logit is bit-identical)"""
 import os, random, subprocess, sys, tempfile, importlib.util
 import numpy as np
 args = [a for a in sys.argv[1:] if not a.startswith('--')]; EXACT = '--exact' in sys.argv
@@ -36,9 +36,8 @@ for k in range(N):
     same = a.shape == b.shape and np.array_equal(a, b); total += 1; exact += same
     if os.environ.get('GLM_WHY'): print('exact' if same else 'inexact', {k: v for k, v in cfg.items() if k in ('H','L','first_dense','K','nope','rope','vh','kvl','ql','bf','shared','prompt_len','n_new','di','mi','D')})
     ok = vt == ctoks and a.shape == b.shape and np.allclose(a, b, rtol=1e-4, atol=1e-4 * max(1.0, float(np.abs(a).max())))
-    aligned = (cfg['kvl'] + cfg['rope']) % 4 == 0; n_al += aligned; ex_al += aligned and same
-    if not ok or (EXACT and aligned and not same):
+    if not ok or (EXACT and not same):
         bad += 1; print('DIFFERENT', d, cfg, '\n  C', ctoks, '\n  V', vt, '\n  shapes', a.shape, b.shape, 'max abs', float(np.abs(a - b).max()) if a.shape == b.shape else None)
         if bad >= 3: break
 if bad: print('glm differential: DIFFERENT, kept in', w); sys.exit(1)
-print('glm differential: %d checkpoints, generated ids identical, all logits within 1e-4; bit-identical: %d of %d with kv_lora+qk_rope a multiple of 4, %d of %d in all' % (total, ex_al, n_al, exact, total))
+print('glm differential: %d checkpoints, generated ids identical, all logits within 1e-4; bit-identical in %d of %d' % (total, exact, total))

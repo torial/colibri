@@ -374,6 +374,34 @@ fn (mut m Model) attention(li int, x []f32, s_n int, pos_base int) ![]f32 {
 	}
 	mut ctx := []f32{len: s_n * h_n * vh}
 	mut sc := []f32{len: m.max_t}
+	if s_n > 4 {
+		// more than four rows (a prompt): the engine does not absorb, it rebuilds every key's per-head nope part and value
+		// with one matmul over the latent cache (kv_b), then scores and mixes in that space
+		tk := pos_base + s_n
+		kvb_dim := h_n * (nope + vh)
+		kvb := kernels.matmul_f32(unsafe { m.lat[li][..tk * kvl] }, l.kv_b, tk, kvl, kvb_dim)!
+		for s in 0 .. s_n {
+			pos := pos_base + s
+			nt := pos + 1
+			for h in 0 .. h_n {
+				qp := (s * h_n + h) * qh
+				for jj in 0 .. nt {
+					kn := jj * kvb_dim + h * (nope + vh)
+					mut a := hybrid_dot(q, qp, kvb, kn, nope, 0, m.blk)
+					a = hybrid_dot(q, qp + nope, m.rop[li], jj * rr, rr, a, m.blk)
+					sc[jj] = a * c.attn_scale
+				}
+				softmax(mut sc, nt)
+				for jj in 0 .. nt {
+					vv := jj * kvb_dim + h * (nope + vh) + nope
+					for dd in 0 .. vh {
+						ctx[(s * h_n + h) * vh + dd] += sc[jj] * kvb[vv + dd]
+					}
+				}
+			}
+		}
+		return kernels.matmul_f32(ctx, l.o, s_n, h_n * vh, d)
+	}
 	for s in 0 .. s_n {
 		pos := pos_base + s
 		nt := pos + 1

@@ -13,7 +13,7 @@ Branch `port/v-leaf-libs`. Everything below is verified by `./run_all.sh` (needs
 | `sample` | `c/sample.h` | `tests/sample_diff`: picks, distributions, RNG state, log-prob bits |
 | `kernels` | `c/quant.h`, `ggml_quants.h`, `matmul_f32.h`, `qi_gemm.h` | `tests/kern_diff`: output bits identical to the direct C call; builds for v2 / v3 / v4 / native |
 | `olmoe` | CPU path of `c/olmoe.c` | `tests/olmoe_diff`: the C engine and the V engine on generated tiny checkpoints, generated ids and every logit of every step bit-identical (v2 / v3 / v4 builds) |
-| `glm` | unquantized path of `c/colibri.c` | `tests/glm_diff`: ids identical, logits within 1e-4 of the C engine (13/16 bit-identical on real-GLM-aligned shapes) |
+| `glm` | unquantized path of `c/colibri.c` | `tests/glm_diff`: ids identical and every logit bit-identical to the C engine (v2 / v3 / v4 builds) |
 | `cmd/colibri_v` | -- | `isa`, `info`, `tok`, `olmoe`, `bench` |
 
 Every differential test has mutation controls: a deliberate break of the V side must be caught. The few that were not
