@@ -40,5 +40,5 @@ fn test_the_score_dot_has_its_lane_structure() {
 	q := []f32{len: 11, init: f32(index) + 1}
 	l := []f32{len: 11, init: 1}
 	// all small integers: exact in any order, so both forms agree on the value
-	assert lat_dot(q, l, 0, 11, true) == 66 && lat_dot(q, l, 0, 11, false) == 66
+	assert lat_dot(q, l, 0, 11, true, 4) == 66 && lat_dot(q, l, 0, 11, false, 0) == 66
 }

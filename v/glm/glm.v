@@ -149,6 +149,7 @@ pub mut:
 	max_t      int
 	cache      []map[int]&Expert
 	clock      u64
+	blk        int  // block width of the engine's scalar dot loops: 8 (AVX-512), 4 (AVX2), 0
 	avx2       bool // the kernels were built for AVX2: the engine's score dot has its 8-lane form
 }
 
@@ -165,6 +166,13 @@ pub fn open(dir string, cap int) !Model {
 	mut m := Model{
 		c:         c
 		avx2:      kernels.isa().contains('avx2')
+		blk:       if kernels.isa().contains('avx512f') {
+			8
+		} else if kernels.isa().contains('avx2') {
+			4
+		} else {
+			0
+		}
 		cache_cap: if cap < 1 { 1 } else { cap }
 		store:     safetensors.open(dir)!
 	}
@@ -276,7 +284,7 @@ fn rope_interleave(mut v []f32, off int, pos int, c &Cfg) {
 
 // lat_dot: the engine's score dot qabs . latent row -- on AVX2 builds eight fused-multiply-add lanes over whole groups of 8
 // (c/colibri.c, "#442"), summed as hsum256 does, then the scalar tail. The lane structure fixes the bits, so it is reproduced.
-fn lat_dot(qabs []f32, lat []f32, off int, kvl int, avx2 bool) f32 {
+fn lat_dot(qabs []f32, lat []f32, off int, kvl int, avx2 bool, blk int) f32 {
 	mut a := f32(0)
 	mut i := 0
 	if avx2 {
@@ -294,8 +302,33 @@ fn lat_dot(qabs []f32, lat []f32, off int, kvl int, avx2 bool) f32 {
 		l3 := acc[3] + acc[7]
 		a = (l0 + l2) + (l1 + l3)
 	}
-	for i < kvl {
-		a += qabs[i] * lat[off + i]
+	return hybrid_dot(qabs, i, lat, off + i, kvl - i, a, blk)
+}
+
+// hybrid_dot: the shape gcc gives a plain `a += x[i]*y[i]` loop on x86 (found with tools/fmaprobe): whole blocks of `w` products
+// multiplied apart and added one by one, the remainder as a chain of fused multiply-adds. w is 8 with AVX-512, 4 with AVX2, and 0
+// (never fused) below.
+fn hybrid_dot(q []f32, qoff int, k []f32, koff int, n int, init f32, w int) f32 {
+	mut a := init
+	mut i := 0
+	if w > 0 {
+		for i + w <= n {
+			for j in 0 .. w {
+				t := q[qoff + i + j] * k[koff + i + j]
+				a = a + t
+			}
+			i += w
+		}
+	} else {
+		for i < n {
+			t := q[qoff + i] * k[koff + i]
+			a = a + t
+			i++
+		}
+		return a
+	}
+	for i < n {
+		a = C.fmaf(q[qoff + i], k[koff + i], a)
 		i++
 	}
 	return a
@@ -355,10 +388,8 @@ fn (mut m Model) attention(li int, x []f32, s_n int, pos_base int) ![]f32 {
 				}
 			}
 			for jj in 0 .. nt {
-				mut a := lat_dot(qabs, m.lat[li], jj * kvl, kvl, m.avx2)
-				for dd in 0 .. rr {
-					a += q[qp + nope + dd] * m.rop[li][jj * rr + dd]
-				}
+				mut a := lat_dot(qabs, m.lat[li], jj * kvl, kvl, m.avx2, m.blk)
+				a = hybrid_dot(q, qp + nope, m.rop[li], jj * rr, rr, a, m.blk)
 				sc[jj] = a * c.attn_scale
 			}
 			softmax(mut sc, nt)
