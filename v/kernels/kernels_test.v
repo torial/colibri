@@ -181,3 +181,21 @@ fn test_reads_a_whole_gguf_tensor() {
 	assert got == want
 	g.close()
 }
+
+fn test_int8_activations_are_close_to_the_float_product() {
+	x := []f32{len: 64, init: f32(index % 9) - 4}
+	q := []i8{len: 2 * 64, init: i8(index % 7 - 3)}
+	sc := [f32(0.5), 0.25]
+	a := matmul_q(x, q, sc, 1, 64, 2)!
+	b := matmul_q_idot(x, q, sc, 1, 64, 2)!
+	for i in 0 .. 2 {
+		assert (if a[i] > b[i] { a[i] - b[i] } else { b[i] - a[i] }) < 0.05 * (1 + (if a[i] < 0 {
+			-a[i]
+		} else {
+			a[i]
+		}))
+	}
+	if _ := matmul_q_idot(x, q, [f32(1)], 1, 64, 2) {
+		assert false // one scale for two rows
+	}
+}

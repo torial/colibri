@@ -196,6 +196,7 @@ pub mut:
 	rop        [][]f32 // [layer][t][qk_rope]: the roped shared key
 	max_t      int
 	bits       int
+	idot       bool // int8 matrices take int8 activations too (the engine's IDOT, on by default); off = float activations
 	cache      []map[int]&Expert
 	clock      u64
 	blk        int  // block width of the engine's scalar dot loops: 8 (AVX-512), 4 (AVX2), 0
@@ -233,6 +234,7 @@ pub fn open_bits(dir string, cap int, bits int) !Model {
 		}
 		cache_cap: if cap < 1 { 1 } else { cap }
 		bits:      bits
+		idot:      true
 		store:     safetensors.open(dir)!
 	}
 	d := i64(c.hidden)
@@ -291,9 +293,21 @@ fn (m &Model) load_w(name string, o int, i int) !W {
 	return quantize_rows(f, o, i, m.bits)
 }
 
-// mm: y[S,O] = x[S,I] . W^T
+// mm: y[S,O] = x[S,I] . W^T; mm_exact is the engine's matmul_qt_ex(..., 0): the attention's query and KV projections never take
+// the integer-activation path
+fn (m &Model) mm_exact(x []f32, s_n int, w &W) ![]f32 {
+	return m.mmx(x, s_n, w, false)
+}
+
 fn (m &Model) mm(x []f32, s_n int, w &W) ![]f32 {
+	return m.mmx(x, s_n, w, true)
+}
+
+fn (m &Model) mmx(x []f32, s_n int, w &W, allow_idot bool) ![]f32 {
 	if w.q.len > 0 {
+		if m.idot && allow_idot {
+			return kernels.matmul_q_idot(x, w.q, w.s, s_n, w.i, w.o)
+		}
 		return kernels.matmul_q(x, w.q, w.s, s_n, w.i, w.o)
 	}
 	return kernels.matmul_f32(x, w.f, s_n, w.i, w.o)
@@ -424,12 +438,12 @@ fn (mut m Model) attention(li int, x []f32, s_n int, pos_base int) ![]f32 {
 	qh := c.qk_head
 	vh := c.v_head
 	kvl := c.kv_lora
-	mut qr := m.mm(x, s_n, &l.q_a)!
+	mut qr := m.mm_exact(x, s_n, &l.q_a)!
 	for s in 0 .. s_n {
 		rmsnorm(mut qr, s * c.q_lora, qr.clone(), s * c.q_lora, l.q_a_ln, c.q_lora, c.eps)
 	}
-	mut q := m.mm(qr, s_n, &l.q_b)!
-	comp := m.mm(x, s_n, &l.kv_a)!
+	mut q := m.mm_exact(qr, s_n, &l.q_b)!
+	comp := m.mm_exact(x, s_n, &l.kv_a)!
 	for s in 0 .. s_n {
 		pos := pos_base + s
 		for h in 0 .. h_n {

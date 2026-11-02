@@ -23,6 +23,7 @@ fn main() {
 		eprintln('${err}')
 		exit(1)
 	}
+	m.idot = !(os.args.len > 6 && os.args[6] == 'noidot')
 	m.keep = true
 	out := m.generate(prompt, full.len - prompt.len) or {
 		eprintln('${err}')

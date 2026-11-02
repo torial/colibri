@@ -20,6 +20,7 @@ fn C.coli_k_threads() int
 fn C.coli_k_matmul_f32(y &f32, x &f32, w &f32, s int, i int, o int)
 fn C.coli_k_dot_f32(x &f32, w &f32, i int) f32
 fn C.coli_k_olm_matmul_q(y &f32, x &f32, q &u8, scale &f32, i int, o int)
+fn C.coli_k_matmul_q_idot(y &f32, x &f32, q &i8, scale &f32, s int, i int, o int)
 fn C.coli_k_matmul_q(y &f32, x &f32, q &i8, scale &f32, s int, i int, o int)
 fn C.coli_k_matmul_i4(y &f32, x &f32, q4 &u8, scale &f32, s int, i int, o int)
 fn C.coli_k_matmul_i4_grouped(y &f32, x &f32, q4 &u8, scale &f32, s int, i int, o int, gs int)
@@ -94,6 +95,20 @@ pub fn olm_matmul_q(x []f32, q []u8, scale []f32, i int, o int) ![]f32 {
 	need('scale', scale.len, o)!
 	mut y := []f32{len: o}
 	C.coli_k_olm_matmul_q(y.data, x.data, q.data, scale.data, i, o)
+	return y
+}
+
+// matmul_q_idot: the same weights, the activations quantized to int8 per row (amax / 127) and multiplied with exact integer dots,
+// scaled once per output: the engines' default for int8 matrices. The result is the same bits on every instruction set.
+pub fn matmul_q_idot(x []f32, q []i8, scale []f32, s int, i int, o int) ![]f32 {
+	shape(s, i, o)!
+	need('x', x.len, i64(s) * i)!
+	need('q', q.len, i64(o) * i)!
+	need('scale', scale.len, o)!
+	mut y := []f32{len: s * o}
+	if s > 0 {
+		C.coli_k_matmul_q_idot(y.data, x.data, q.data, scale.data, s, i, o)
+	}
 	return y
 }
 

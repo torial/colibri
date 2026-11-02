@@ -80,6 +80,15 @@ void coli_k_olm_matmul_q(float *y, const float *x, const int8_t *q, const float 
     }
 }
 
+/* int8 weights with the activations quantized per row to int8 (qrow_i8: amax/127), exact int32 dots scaled once per output --
+ * what matmul_qt does for an int8 matrix when IDOT is on (the engines' default) */
+void coli_k_matmul_q_idot(float *y, const float *x, const int8_t *q, const float *scale, int S, int I, int O) {
+    int8_t *xq = (int8_t *)malloc((size_t)S * (size_t)I); float *sx = (float *)malloc((size_t)S * sizeof(float));
+    for (int s = 0; s < S; s++) sx[s] = qrow_i8(x + (int64_t)s * I, xq + (int64_t)s * I, I);
+    matmul_q_idot(y, xq, sx, q, scale, S, I, O);
+    free(xq); free(sx);
+}
+
 /* int8 / int4 / fp8 / mxfp4 weights, f32 activations */
 void coli_k_matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int S, int I, int O) { matmul_q(y, x, q, scale, S, I, O); }
 void coli_k_matmul_i4(float *y, const float *x, const uint8_t *q4, const float *scale, int S, int I, int O) { matmul_i4(y, x, q4, scale, S, I, O); }
